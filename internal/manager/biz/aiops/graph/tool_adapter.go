@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	einotool "github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
@@ -11,6 +12,36 @@ import (
 
 	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
 )
+
+// toolMemo is a per-run cache of identical (read-tool, args) calls. The
+// graph — and therefore the wrapped tool set — is rebuilt per request, so
+// one memo per WrapBaseTools call is naturally scoped to a single ReAct
+// run. Within that run an identical call (same tool, byte-identical args,
+// seconds apart) cannot yield new information and is almost always a ReAct
+// loop artifact; returning the prior result skips re-executing an expensive
+// tool (SSH probe, PromQL, LLM-backed query_translate) and keeps an
+// identical-call loop from burning the iteration budget on real work. Only
+// Class=="read" tools are memoized — write/destructive tools never touch
+// this path, so the review/mutation flow is unaffected.
+type toolMemo struct {
+	mu sync.Mutex
+	m  map[string]string
+}
+
+func newToolMemo() *toolMemo { return &toolMemo{m: make(map[string]string)} }
+
+func (t *toolMemo) get(k string) (string, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	v, ok := t.m[k]
+	return v, ok
+}
+
+func (t *toolMemo) put(k, v string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.m[k] = v
+}
 
 // WrapBaseTool adapts an ongrid basetool.BaseTool to eino's
 // components/tool.BaseTool + InvokableTool surface so the eino ToolsNode
@@ -67,6 +98,26 @@ func WithInvokeOpts(opts ...basetool.InvokeOption) einotool.Option {
 // reaches this adapter.
 type einoToolAdapter struct {
 	inner basetool.BaseTool
+	// memo is the per-run identical-call cache (nil = memoization off, e.g.
+	// the single-tool WrapBaseTool path used by tests). Shared across all
+	// adapters built by one WrapBaseTools call.
+	memo *toolMemo
+	// Info() is resolved once (name + read-ness) for the memo key + gate.
+	infoOnce  sync.Once
+	cacheName string
+	cacheable bool // Class == "read"
+}
+
+// resolveInfo lazily caches the tool's name + whether it's a pure-read tool
+// (the only class we memoize). Info() is otherwise called by eino at build
+// time; caching here avoids a call per dispatch.
+func (a *einoToolAdapter) resolveInfo(ctx context.Context) {
+	a.infoOnce.Do(func() {
+		if info, err := a.inner.Info(ctx); err == nil && info != nil {
+			a.cacheName = info.Name
+			a.cacheable = info.Class == "read"
+		}
+	})
 }
 
 // Info returns the eino schema.ToolInfo for this tool. WhenToUse from
@@ -133,6 +184,19 @@ func (a *einoToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON stri
 	if a == nil || a.inner == nil {
 		return "", fmt.Errorf("graph: tool adapter has nil inner tool")
 	}
+	// Per-run memoization of identical read-tool calls. Key on exact args;
+	// a hit returns the prior result without re-executing. Only read tools
+	// (resolved below) are eligible.
+	var memoKey string
+	if a.memo != nil {
+		a.resolveInfo(ctx)
+		if a.cacheable && a.cacheName != "" {
+			memoKey = a.cacheName + "\x00" + argumentsInJSON
+			if cached, ok := a.memo.get(memoKey); ok {
+				return cached, nil
+			}
+		}
+	}
 	resolved := einotool.GetImplSpecificOptions(&einoInvokeOptKey{}, opts...)
 	out, err := a.inner.InvokableRun(ctx, argumentsInJSON, resolved.opts...)
 	if err != nil {
@@ -155,6 +219,11 @@ func (a *einoToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON stri
 		}
 		return string(envelope), nil
 	}
+	// Cache successful read-tool results only — a failed call stays
+	// retryable (a transient error shouldn't be pinned for the whole run).
+	if memoKey != "" {
+		a.memo.put(memoKey, out)
+	}
 	return out, nil
 }
 
@@ -163,12 +232,16 @@ func (a *einoToolAdapter) InvokableRun(ctx context.Context, argumentsInJSON stri
 // Nil entries in the input are skipped so callers can pass a sparse
 // list (e.g. from a skill activation filter).
 func WrapBaseTools(tools []basetool.BaseTool) []einotool.BaseTool {
+	// One memo shared by every tool in this build = scoped to one run
+	// (the graph is rebuilt per request). The single-tool WrapBaseTool
+	// path deliberately leaves memo nil (tests / non-graph callers).
+	memo := newToolMemo()
 	out := make([]einotool.BaseTool, 0, len(tools))
 	for _, t := range tools {
 		if t == nil {
 			continue
 		}
-		out = append(out, WrapBaseTool(t))
+		out = append(out, &einoToolAdapter{inner: t, memo: memo})
 	}
 	return out
 }

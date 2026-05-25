@@ -192,3 +192,69 @@ func TestWrapBaseTools_SkipsNil(t *testing.T) {
 		t.Fatalf("WrapBaseTools dropped wrong count: got %d entries, want 2", len(out))
 	}
 }
+
+// Per-run memo: an identical read-tool call returns the cached result
+// without re-executing; distinct args re-execute.
+func TestEinoToolAdapter_MemoizesIdenticalReadCalls(t *testing.T) {
+	t.Parallel()
+	inner := &fakeBaseTool{name: "query_promql", class: "read", runResp: `{"v":1}`}
+	a := &einoToolAdapter{inner: inner, memo: newToolMemo()}
+	ctx := context.Background()
+	r1, err1 := a.InvokableRun(ctx, `{"q":"up"}`)
+	r2, err2 := a.InvokableRun(ctx, `{"q":"up"}`)
+	if err1 != nil || err2 != nil {
+		t.Fatalf("errs: %v %v", err1, err2)
+	}
+	if r1 != `{"v":1}` || r2 != `{"v":1}` {
+		t.Fatalf("results = %q, %q; want cached identical", r1, r2)
+	}
+	if got := inner.calls.Load(); got != 1 {
+		t.Errorf("identical read calls should execute once, got %d", got)
+	}
+	if _, err := a.InvokableRun(ctx, `{"q":"down"}`); err != nil {
+		t.Fatalf("distinct call err: %v", err)
+	}
+	if got := inner.calls.Load(); got != 2 {
+		t.Errorf("distinct args should re-execute, got %d", got)
+	}
+}
+
+// Write/destructive tools are never memoized — the review/mutation flow
+// must see every call.
+func TestEinoToolAdapter_DoesNotMemoizeWriteTool(t *testing.T) {
+	t.Parallel()
+	inner := &fakeBaseTool{name: "host_restart_service", class: "destructive", runResp: `{"ok":true}`}
+	a := &einoToolAdapter{inner: inner, memo: newToolMemo()}
+	ctx := context.Background()
+	_, _ = a.InvokableRun(ctx, `{"svc":"nginx"}`)
+	_, _ = a.InvokableRun(ctx, `{"svc":"nginx"}`)
+	if got := inner.calls.Load(); got != 2 {
+		t.Errorf("destructive tool must NOT be memoized; want 2 executions, got %d", got)
+	}
+}
+
+// A failed call stays retryable — the error envelope is not cached.
+func TestEinoToolAdapter_DoesNotMemoizeErrors(t *testing.T) {
+	t.Parallel()
+	inner := &fakeBaseTool{name: "query_x", class: "read", runErr: errors.New("boom")}
+	a := &einoToolAdapter{inner: inner, memo: newToolMemo()}
+	ctx := context.Background()
+	_, _ = a.InvokableRun(ctx, `{"q":"a"}`)
+	_, _ = a.InvokableRun(ctx, `{"q":"a"}`)
+	if got := inner.calls.Load(); got != 2 {
+		t.Errorf("errored read calls must stay retryable; want 2 executions, got %d", got)
+	}
+}
+
+// The single-tool WrapBaseTool path leaves memo nil — no caching.
+func TestEinoToolAdapter_NoMemoByDefault(t *testing.T) {
+	t.Parallel()
+	inner := &fakeBaseTool{name: "query_x", class: "read", runResp: "ok"}
+	a := &einoToolAdapter{inner: inner} // memo nil
+	ctx := context.Background()
+	_, _ = a.InvokableRun(ctx, `{"q":"a"}`)
+	_, _ = a.InvokableRun(ctx, `{"q":"a"}`)
+	if got := inner.calls.Load(); got != 2 {
+		t.Errorf("memo-less adapter must execute each call; want 2, got %d", got)
+	}
+}
