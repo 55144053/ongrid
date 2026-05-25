@@ -60,14 +60,24 @@ type Bridge struct {
 	// per-provider client cache so we don't rebuild HTTP / token
 	// state on every inbound event. Keyed by app_id.
 	feishuCache sync.Map // app_id -> *feishu.Client
-	log         *slog.Logger
+	// seen dedups re-delivered events (Telegram getUpdates replays the
+	// unacked batch on a poller reconnect) so the agent doesn't answer the
+	// same message twice. Keyed by (provider, app_id, event_id).
+	seen *dedupSet
+	log  *slog.Logger
 }
 
 func NewBridge(repo Repo, agent AgentSession, serviceUserID uint64, log *slog.Logger) *Bridge {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Bridge{repo: repo, agent: agent, serviceUserID: serviceUserID, log: log.With(slog.String("comp", "imbridge"))}
+	return &Bridge{
+		repo:          repo,
+		agent:         agent,
+		serviceUserID: serviceUserID,
+		seen:          newDedupSet(2048),
+		log:           log.With(slog.String("comp", "imbridge")),
+	}
 }
 
 // InboundMessage describes a normalized inbound event the bridge can
@@ -109,6 +119,21 @@ func (b *Bridge) HandleInbound(ctx context.Context, sender Sender, msg InboundMe
 	if msg.Text == "" {
 		b.log.Debug("inbound has no text — ignoring", slog.String("event_id", msg.EventID))
 		return nil
+	}
+
+	// Dedup re-delivered events. Long-poll providers replay the unacked
+	// batch on a reconnect; without this the agent would answer the same
+	// message twice. Marked on entry (not on success) — a duplicate reply
+	// is worse than not re-running a message that already started. Events
+	// with no id (shouldn't happen for telegram/feishu) skip the check.
+	if msg.EventID != "" {
+		key := msg.Provider + ":" + msg.AppID + ":" + msg.EventID
+		if b.seen.seenOrAdd(key) {
+			b.log.Debug("inbound duplicate event — skipping",
+				slog.String("provider", msg.Provider),
+				slog.String("event_id", msg.EventID))
+			return nil
+		}
 	}
 
 	// 1. Resolve app + thread mapping (lazy create).

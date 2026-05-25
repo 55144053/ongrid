@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	model "github.com/ongridio/ongrid/internal/manager/model/imbridge"
 )
@@ -154,6 +156,76 @@ func TestSenderAdapterRejectsNonNumericID(t *testing.T) {
 
 // TestStreamClientAllowlist: NewStreamClient parses app.AllowFrom into the
 // sender set (separators + tg:/telegram: prefixes + dedup all handled).
+// 429 with retry_after → wait + retry, then succeed.
+func TestCallRetriesOn429(t *testing.T) {
+	var calls int32
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			io.WriteString(w, `{"ok":false,"error_code":429,"description":"Too Many Requests: retry after 1","parameters":{"retry_after":1}}`)
+			return
+		}
+		io.WriteString(w, `{"ok":true,"result":{"message_id":5}}`)
+	})
+	id, err := c.SendMessage(context.Background(), "1", "hi")
+	if err != nil || id != 5 {
+		t.Fatalf("after 429 retry: id=%d err=%v; want 5, nil", id, err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("want 2 calls (429 then 200), got %d", got)
+	}
+}
+
+// 5xx (even with a non-JSON body, as a proxy/nginx might return) → retry.
+func TestCallRetriesOn5xx(t *testing.T) {
+	var calls int32
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			io.WriteString(w, `<html>502 Bad Gateway</html>`)
+			return
+		}
+		io.WriteString(w, `{"ok":true,"result":{"message_id":9}}`)
+	})
+	id, err := c.SendMessage(context.Background(), "1", "hi")
+	if err != nil || id != 9 {
+		t.Fatalf("after 5xx retry: id=%d err=%v; want 9, nil", id, err)
+	}
+}
+
+// 4xx (other than 429) is a hard error — must NOT retry.
+func TestCallNoRetryOn4xx(t *testing.T) {
+	var calls int32
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"ok":false,"error_code":400,"description":"Bad Request: chat not found"}`)
+	})
+	if _, err := c.SendMessage(context.Background(), "1", "hi"); err == nil {
+		t.Fatal("400 should be a hard error")
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("400 must not retry; want 1 call, got %d", got)
+	}
+}
+
+// A cancelled context must short-circuit, not sleep out a long retry_after.
+func TestCallRetryRespectsContext(t *testing.T) {
+	c := testClient(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		io.WriteString(w, `{"ok":false,"error_code":429,"description":"slow down","parameters":{"retry_after":30}}`)
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	if _, err := c.SendMessage(ctx, "1", "hi"); err == nil {
+		t.Fatal("want error on cancelled context")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Errorf("cancelled ctx should not sleep out retry_after; took %v", elapsed)
+	}
+}
+
 func TestStreamClientAllowlist(t *testing.T) {
 	app := &model.ImApp{AppSecret: "tok", AllowFrom: "tg:111, 222 333\n444;111"}
 	c := NewStreamClient(app, nil, nil)
