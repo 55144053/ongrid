@@ -13,7 +13,25 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
+
+// maxCallRetries bounds retries on rate-limit (429) and transient server (5xx)
+// responses. Network-level errors (resp err) are NOT retried here — they bubble
+// to the supervisor's reconnect-with-backoff, and for getUpdates the per-poll
+// context deadline is intentional stall detection.
+const maxCallRetries = 3
+
+// maxRetryWait caps how long a single retry will sleep, even if Telegram's
+// retry_after asks for longer (a multi-minute 429 should surface, not block a
+// poll loop indefinitely).
+const maxRetryWait = 60 * time.Second
+
+// backoffDelay is the wait for transient (5xx) retries when Telegram gives no
+// retry_after: 1s, 2s, 4s.
+func backoffDelay(attempt int) time.Duration {
+	return time.Duration(1<<uint(attempt)) * time.Second
+}
 
 // Client is a minimal Telegram Bot API client. It uses a zero-value
 // http.Client (DefaultTransport), so it honors HTTP(S)_PROXY/NO_PROXY env —
@@ -39,6 +57,9 @@ type apiResp struct {
 	Result      json.RawMessage `json:"result"`
 	Description string          `json:"description"`
 	ErrorCode   int             `json:"error_code"`
+	Parameters  *struct {
+		RetryAfter int `json:"retry_after"`
+	} `json:"parameters"`
 }
 
 func (c *Client) call(ctx context.Context, method string, body any) (json.RawMessage, error) {
@@ -46,25 +67,51 @@ func (c *Client) call(ctx context.Context, method string, body any) (json.RawMes
 	if err != nil {
 		return nil, fmt.Errorf("marshal %s: %w", method, err)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(method), bytes.NewReader(b))
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint(method), bytes.NewReader(b))
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := c.hc.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		raw, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		// Retry rate-limit (429, honoring retry_after) + transient server
+		// errors (5xx) — decided on HTTP status before decoding, since a 5xx
+		// body may not even be valid JSON. Other 4xx (400/401/403) are hard
+		// errors; retrying won't help.
+		if attempt < maxCallRetries && (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500) {
+			wait := backoffDelay(attempt)
+			if resp.StatusCode == http.StatusTooManyRequests {
+				var e apiResp
+				if json.Unmarshal(raw, &e) == nil && e.Parameters != nil && e.Parameters.RetryAfter > 0 {
+					wait = time.Duration(e.Parameters.RetryAfter) * time.Second
+				}
+			}
+			if wait > maxRetryWait {
+				wait = maxRetryWait
+			}
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(wait):
+			}
+			continue
+		}
+
+		var env apiResp
+		if uerr := json.Unmarshal(raw, &env); uerr != nil {
+			return nil, fmt.Errorf("%s decode: %w (body=%s)", method, uerr, truncate(raw, 200))
+		}
+		if !env.OK {
+			return nil, fmt.Errorf("telegram %s: %d %s", method, env.ErrorCode, env.Description)
+		}
+		return env.Result, nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.hc.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
-	var env apiResp
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return nil, fmt.Errorf("%s decode: %w (body=%s)", method, err, truncate(raw, 200))
-	}
-	if !env.OK {
-		return nil, fmt.Errorf("telegram %s: %d %s", method, env.ErrorCode, env.Description)
-	}
-	return env.Result, nil
 }
 
 // Update is one getUpdates entry (only the fields the bridge consumes).
