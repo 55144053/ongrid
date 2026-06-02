@@ -48,10 +48,17 @@ export default function AlertsPage() {
   const [severityFilter, setSeverityFilter] = useState<string>('');
   const [resolving, setResolving] = useState<{ incident: Incident } | null>(null);
   const [ackBusyId, setAckBusyId] = useState<number | null>(null);
-  // Device-id → name, so the Target column can show a device name (not just
-  // an id). Keyed by both edge.id and edge.device_id since an incident's
-  // target_id may be either. Best-effort: missing name falls back to "Device <id>".
-  const [edgeNames, setEdgeNames] = useState<Record<string, string>>({});
+  // device_id → name for the Target column. incident.target_id is the
+  // device id (renamed from edge id May 2026, see alert model.go:212).
+  // Best-effort: missing name falls back to "Device <id>".
+  //
+  // IMPORTANT: only key by edge.device_id. The old code also wrote
+  // m[String(e.id)] = e.name which mixed edge.id space with device.id
+  // space — when two edges had id↔device_id swapped (e.g. edge 3 →
+  // device 4 + edge 4 → device 3), the later-iterated edge would
+  // clobber both entries with its own name, so device #3 and #4
+  // rendered with the same name. See 2026-06-02 fix.
+  const [deviceNames, setDeviceNames] = useState<Record<string, string>>({});
   // Source of truth for the global "未确认" count — same store the
   // sidebar badge polls. Reading from here (instead of a page-local
   // computation over filtered items) guarantees the page header
@@ -98,10 +105,11 @@ export default function AlertsPage() {
         if (cancelled) return;
         const m: Record<string, string> = {};
         for (const e of r.items ?? []) {
-          m[String(e.id)] = e.name;
+          // Only key by device_id. Mixing edge.id keys caused
+          // cross-contamination across rows when ids were swapped.
           if (e.device_id != null) m[String(e.device_id)] = e.name;
         }
-        setEdgeNames(m);
+        setDeviceNames(m);
       })
       .catch(() => {
         /* best-effort: Target falls back to "Device <id>" */
@@ -216,7 +224,7 @@ export default function AlertsPage() {
                   <IncidentRow
                     key={inc.id}
                     incident={inc}
-                    edgeNames={edgeNames}
+                    deviceNames={deviceNames}
                     ackBusy={ackBusyId === inc.id}
                     canMutate={canMutate}
                     onAck={async () => {
@@ -259,14 +267,14 @@ export default function AlertsPage() {
 
 function IncidentRow({
   incident,
-  edgeNames,
+  deviceNames,
   onAck,
   onResolve,
   ackBusy,
   canMutate,
 }: {
   incident: Incident;
-  edgeNames: Record<string, string>;
+  deviceNames: Record<string, string>;
   onAck(): void;
   onResolve(): void;
   ackBusy: boolean;
@@ -324,8 +332,8 @@ function IncidentRow({
         {/* Target stays simple: the device (name + id). Detail lives in the
             wide Summary column — never dump the internal dedupe_key here. */}
         {incident.target_type === 'edge' && incident.target_id
-          ? (edgeNames[incident.target_id]
-              ? `${edgeNames[incident.target_id]} · #${incident.target_id}`
+          ? (deviceNames[incident.target_id]
+              ? `${deviceNames[incident.target_id]} · #${incident.target_id}`
               : tr(`设备 ${incident.target_id}`, `Device ${incident.target_id}`))
           : '—'}
       </td>
