@@ -250,8 +250,32 @@ func (g *workerGenerator) buildPrompt(rpt *model.Report, facts *ReportFacts) str
 		b.WriteString(override)
 		b.WriteString("\n")
 	}
+	// Explicit output-language directive — the prompt + persona are in
+	// Chinese, so without this the model narrates in Chinese even when the
+	// operator's UI is English. Mirrors the investigator's localeDirective.
+	// See feedback_ai_output_locale.
+	if d := localeDirective(g.localeFor(rpt)); d != "" {
+		b.WriteString("\n")
+		b.WriteString(d)
+		b.WriteString("\n")
+	}
 	b.WriteString("\n按 persona 描述的 ContentJSON schema 输出，只输出 JSON。")
 	return b.String()
+}
+
+// localeDirective renders an explicit output-language line for the
+// narrative + advice (the LLM-authored prose). Empty/unknown → "" so the
+// persona's implicit language wins. Mirrors investigator.localeDirective.
+func localeDirective(locale string) string {
+	primary := strings.ToLower(strings.SplitN(strings.TrimSpace(locale), "-", 2)[0])
+	switch primary {
+	case "en":
+		return "LANGUAGE: Write the narrative headline, all narrative paragraphs, and every advice item in English. The facts data + persona description are in Chinese; render their meaning in English and never echo raw Chinese prose. Leave identifiers, hostnames, and metric names verbatim."
+	case "zh":
+		return "LANGUAGE: 叙事 headline、所有叙事段落、以及每条 advice 全部用简体中文撰写。"
+	default:
+		return ""
+	}
 }
 
 // scheduleOverride fetches the owning schedule's prompt_override, if any.
