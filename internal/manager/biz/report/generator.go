@@ -1,0 +1,303 @@
+package report
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/chatruntime"
+	model "github.com/ongridio/ongrid/internal/manager/model/report"
+)
+
+// WorkerSpawner is the narrow seam onto chatruntime.Runtime that the
+// generator uses to run the reporter persona. Mirrors the investigator's
+// WorkerSpawner so the wiring in main.go is the same shim. Kept as an
+// interface so tests inject a fake that returns canned ContentJSON
+// without standing up the whole graph kernel.
+type WorkerSpawner interface {
+	SpawnWorker(ctx context.Context, req chatruntime.SpawnRequest) (*chatruntime.Worker, error)
+}
+
+// GeneratorConfig tunes the worker generator.
+type GeneratorConfig struct {
+	// Persona is the reporter agent name (frontmatter `name`). Defaults
+	// to model.DefaultReporterPersona.
+	Persona string
+	// Timeout caps a single report generation. 0 → 120s (the project-
+	// wide LLM timeout floor).
+	Timeout time.Duration
+	// DefaultLocale is used when a report has no owner-locale signal
+	// (scheduled reports run headless — there's no Accept-Language).
+	// Empty → "en" per feedback_ai_output_locale (auto-triggered LLM
+	// output follows ONGRID_DEFAULT_LOCALE).
+	DefaultLocale string
+}
+
+// workerGenerator implements Generator: it turns a pending report into a
+// finished one by collecting facts, running the reporter worker, and
+// writing validated ContentJSON. Numbers are overwritten from facts
+// post-LLM (defense-in-depth) so a model that fiddles a figure can't
+// leak it into the report.
+type workerGenerator struct {
+	repo      Repo
+	facts     FactsCollector
+	spawner   WorkerSpawner
+	cfg       GeneratorConfig
+	log       *slog.Logger
+}
+
+// NewWorkerGenerator builds the real generator. A nil spawner or facts
+// collector is a wiring error and panics — main.go always supplies both.
+func NewWorkerGenerator(repo Repo, facts FactsCollector, spawner WorkerSpawner, cfg GeneratorConfig, log *slog.Logger) Generator {
+	if repo == nil || facts == nil || spawner == nil {
+		panic("report: nil dependency to NewWorkerGenerator")
+	}
+	if cfg.Persona == "" {
+		cfg.Persona = model.DefaultReporterPersona
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = 120 * time.Second
+	}
+	if cfg.DefaultLocale == "" {
+		cfg.DefaultLocale = "en"
+	}
+	if log == nil {
+		log = slog.Default()
+	}
+	return &workerGenerator{repo: repo, facts: facts, spawner: spawner, cfg: cfg, log: log.With(slog.String("comp", "report-generator"))}
+}
+
+// Generate runs the full pipeline for one report id. Always reaches a
+// terminal state (ready/failed) — a panic or early return that left the
+// row "generating" would strand it in the UI.
+func (g *workerGenerator) Generate(ctx context.Context, reportID string) {
+	rpt, err := g.repo.GetReport(ctx, reportID)
+	if err != nil {
+		g.log.Warn("load report failed", slog.String("report_id", reportID), slog.Any("err", err))
+		return
+	}
+	if rpt.Status != model.StatusPending {
+		// Already handled (double-fire, restart re-attach). No-op.
+		return
+	}
+
+	rpt.Status = model.StatusGenerating
+	if err := g.repo.UpdateReport(ctx, rpt); err != nil {
+		g.log.Warn("flip generating failed", slog.String("report_id", reportID), slog.Any("err", err))
+		// Continue anyway — the worst case is the UI lags one state.
+	}
+
+	if err := g.generate(ctx, rpt); err != nil {
+		g.fail(ctx, rpt, err.Error())
+	}
+}
+
+func (g *workerGenerator) generate(ctx context.Context, rpt *model.Report) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.cfg.Timeout)
+	defer cancel()
+
+	period := Period{Start: rpt.PeriodStart, End: rpt.PeriodEnd}
+	prev := previousPeriod(period)
+	scope := ParseScope(rpt.ScopeJSON)
+
+	facts, err := g.facts.Collect(ctx, period, prev, scope)
+	if err != nil {
+		return fmt.Errorf("collect facts: %w", err)
+	}
+
+	prompt := g.buildPrompt(rpt, facts)
+	worker, err := g.spawner.SpawnWorker(ctx, chatruntime.SpawnRequest{
+		AgentName:   g.cfg.Persona,
+		Prompt:      prompt,
+		Background:  false, // sync — this goroutine owns the lifecycle
+		SessionKind: "report",
+		OwnerUserID: rpt.CreatedBy,
+		Locale:      g.localeFor(rpt),
+	})
+	if err != nil {
+		return fmt.Errorf("spawn worker: %w", err)
+	}
+	if worker == nil {
+		return fmt.Errorf("spawn worker: nil worker")
+	}
+	if sid := worker.SessionID; sid != "" {
+		rpt.AuditSessionID = &sid
+	}
+	if wid := worker.ID; wid != "" {
+		rpt.WorkerID = &wid
+	}
+	if werr := strings.TrimSpace(worker.Err); werr != "" {
+		return fmt.Errorf("worker: %s", werr)
+	}
+
+	content, err := ParseContent(extractJSON(worker.Result))
+	if err != nil {
+		return fmt.Errorf("parse content: %w", err)
+	}
+
+	// Defense-in-depth: overwrite every SQL-true field from facts so the
+	// LLM owns only prose. Hero + Actions are pure numbers; KeyIncidents
+	// ids/durations/status are SQL-true but we preserve the LLM's
+	// root-cause snippet by matching on id.
+	content.Hero = facts.Hero
+	content.Actions = facts.Actions
+	content.KeyIncidents = mergeIncidents(facts.Incidents, content.KeyIncidents)
+	content.Version = ContentVersion
+	content.Metadata = ContentMeta{
+		PeriodStart: period.Start.Format(time.RFC3339),
+		PeriodEnd:   period.End.Format(time.RFC3339),
+		DataSources: []string{"incidents", "audit_log", "proposals", "edges"},
+	}
+
+	rpt.ContentJSON = content.MustJSON()
+	rpt.ContentMD = content.RenderMarkdown(rpt.Title)
+	rpt.SummaryText = truncate(content.Narrative.Headline, 510)
+	rpt.Status = model.StatusReady
+	rpt.ErrorMsg = ""
+	now := time.Now().UTC()
+	rpt.GeneratedAt = &now
+	if err := g.repo.UpdateReport(ctx, rpt); err != nil {
+		return fmt.Errorf("persist ready report: %w", err)
+	}
+	g.log.Info("report ready",
+		slog.String("report_id", rpt.ID),
+		slog.Int("incidents", len(facts.Incidents)))
+	return nil
+}
+
+func (g *workerGenerator) fail(ctx context.Context, rpt *model.Report, reason string) {
+	rpt.Status = model.StatusFailed
+	rpt.ErrorMsg = truncate(reason, 2000)
+	// Use a background ctx so a cancelled/timed-out request still records
+	// the failure terminal state.
+	if err := g.repo.UpdateReport(context.WithoutCancel(ctx), rpt); err != nil {
+		g.log.Warn("persist failed report", slog.String("report_id", rpt.ID), slog.Any("err", err))
+	}
+	g.log.Warn("report generation failed", slog.String("report_id", rpt.ID), slog.String("reason", reason))
+}
+
+// buildPrompt renders the reporter worker's user message: the facts JSON
+// plus any per-schedule prompt override. The persona body carries the
+// ContentJSON schema + entity-token instructions; this is just the
+// payload + override.
+func (g *workerGenerator) buildPrompt(rpt *model.Report, facts *ReportFacts) string {
+	var b strings.Builder
+	b.WriteString("生成一份运维报告。下面是本周期已经算好的事实数据（数字均为准确值，禁止改动或新增数字）：\n\n```json\n")
+	b.WriteString(factsJSON(facts))
+	b.WriteString("\n```\n\n")
+	b.WriteString(fmt.Sprintf("报告周期：%s — %s（%s）。\n", rpt.PeriodStart.Format("2006-01-02"), rpt.PeriodEnd.Format("2006-01-02"), rpt.Kind))
+	if override := g.scheduleOverride(rpt); override != "" {
+		b.WriteString("\n额外要求：\n")
+		b.WriteString(override)
+		b.WriteString("\n")
+	}
+	b.WriteString("\n按 persona 描述的 ContentJSON schema 输出，只输出 JSON。")
+	return b.String()
+}
+
+// scheduleOverride fetches the owning schedule's prompt_override, if any.
+// Manual reports (nil ScheduleID) have no override.
+func (g *workerGenerator) scheduleOverride(rpt *model.Report) string {
+	if rpt.ScheduleID == nil {
+		return ""
+	}
+	s, err := g.repo.GetSchedule(context.Background(), *rpt.ScheduleID)
+	if err != nil || s.PromptOverride == nil {
+		return ""
+	}
+	return strings.TrimSpace(*s.PromptOverride)
+}
+
+func (g *workerGenerator) localeFor(rpt *model.Report) string {
+	// Scheduled reports run headless; there's no per-request locale.
+	// Future: store an owner-locale snapshot on the schedule. For now
+	// the configured default wins.
+	return g.cfg.DefaultLocale
+}
+
+// --- helpers ---
+
+// previousPeriod returns the window immediately before p, of equal
+// length — used to compute period-over-period deltas.
+func previousPeriod(p Period) Period {
+	d := p.End.Sub(p.Start)
+	return Period{Start: p.Start.Add(-d), End: p.Start}
+}
+
+// mergeIncidents rebuilds KeyIncidents from SQL-true facts (top 5 by
+// duration), preserving any LLM-supplied root-cause snippet matched by
+// id. Caps at 5 to keep the report scannable.
+func mergeIncidents(facts []IncidentFact, llm []KeyIncident) []KeyIncident {
+	snippetByID := map[uint64]string{}
+	for _, k := range llm {
+		if k.RootCauseSnippet != "" {
+			snippetByID[k.ID] = k.RootCauseSnippet
+		}
+	}
+	sorted := append([]IncidentFact(nil), facts...)
+	// insertion sort by duration desc — small slices.
+	for i := 1; i < len(sorted); i++ {
+		for j := i; j > 0 && sorted[j].DurationMin > sorted[j-1].DurationMin; j-- {
+			sorted[j], sorted[j-1] = sorted[j-1], sorted[j]
+		}
+	}
+	n := len(sorted)
+	if n > 5 {
+		n = 5
+	}
+	out := make([]KeyIncident, 0, n)
+	for _, f := range sorted[:n] {
+		out = append(out, KeyIncident{
+			ID:               f.ID,
+			Title:            f.Title,
+			Severity:         f.Severity,
+			DurationMin:      f.DurationMin,
+			Status:           f.Status,
+			RootCauseSnippet: snippetByID[f.ID],
+		})
+	}
+	return out
+}
+
+func factsJSON(f *ReportFacts) string {
+	b, err := json.MarshalIndent(f, "", "  ")
+	if err != nil {
+		return "{}"
+	}
+	return string(b)
+}
+
+// extractJSON strips a leading ```json fence / trailing fence and any
+// prose around a single top-level object, so a chatty model still
+// yields parseable content. Mirrors the lenient parse in query_translate.
+func extractJSON(raw string) string {
+	s := strings.TrimSpace(raw)
+	if i := strings.Index(s, "```"); i >= 0 {
+		// drop opening fence (```json or ```)
+		rest := s[i+3:]
+		if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+			rest = rest[nl+1:]
+		}
+		if j := strings.Index(rest, "```"); j >= 0 {
+			rest = rest[:j]
+		}
+		s = strings.TrimSpace(rest)
+	}
+	if i := strings.IndexByte(s, '{'); i > 0 {
+		s = s[i:]
+	}
+	if j := strings.LastIndexByte(s, '}'); j >= 0 && j+1 < len(s) {
+		s = s[:j+1]
+	}
+	return s
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "…"
+}
