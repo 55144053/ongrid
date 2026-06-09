@@ -48,13 +48,15 @@ combos so users can run them directly on heterogeneous hosts.
 ## Release flow
 
 1. Bump the version: edit `VERSION` at the repo root (e.g. `v0.1.1`).
-2. Run `make package` from the repo root. Use `make package TARGET_ARCH=arm64`
-   for an ARM64 server package. This will:
+2. Run `make package-all` from the repo root to build both server packages.
+   Use `make package TARGET_ARCH=arm64` only when you need a single ARM64
+   package. This will:
    - `build-edge-all`    — cross-compile ongrid-edge for 4 targets
    - `docker-build`      — build `ongrid:<VERSION>` image for `linux/<arch>`
    - stage everything under `dist/stage/ongrid-<VERSION>-linux-<arch>/`
-   - emit the tarball + sha256 under `dist/out/`
-3. Ship: `scp dist/out/ongrid-v<VERSION>-linux-<arch>.tar.xz user@host:~/`.
+   - emit the amd64/arm64 tarballs + sha256 files under `dist/out/`
+3. Ship the matching package, for example:
+   `scp dist/out/ongrid-v<VERSION>-linux-<arch>.tar.xz user@host:~/`.
 4. On the target: untar, `sudo ./install.sh`.
 
 ## Checksum

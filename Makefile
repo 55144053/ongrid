@@ -20,6 +20,7 @@ endif
 PACKAGE_TARGET := $(TARGET_OS)-$(TARGET_ARCH)
 STAGE       := dist/stage/ongrid-$(VERSION)-$(PACKAGE_TARGET)
 OUT         := dist/out
+PACKAGE_CLEAN ?= 1
 
 DB_DSN     ?= root:root@tcp(127.0.0.1:3306)/ongrid?charset=utf8mb4&parseTime=true&loc=Local
 MIGRATIONS := db/migrations
@@ -236,10 +237,11 @@ FRONTIER_VERSION ?= v1.2.4
 
 .PHONY: docker-build-broker
 docker-build-broker: ## [release] 本地构建 singchia/frontier:$(FRONTIER_VERSION)（已存在则跳过）
-	@if docker image inspect singchia/frontier:$(FRONTIER_VERSION) >/dev/null 2>&1; then \
-		echo "[broker] singchia/frontier:$(FRONTIER_VERSION) already present locally — skipping rebuild"; \
+	@existing_platform=$$(docker image inspect -f '{{.Os}}/{{.Architecture}}' singchia/frontier:$(FRONTIER_VERSION) 2>/dev/null || true); \
+	if [ "$$existing_platform" = "$(PLATFORM)" ]; then \
+		echo "[broker] singchia/frontier:$(FRONTIER_VERSION) already present for $(PLATFORM) — skipping rebuild"; \
 	else \
-		test -d $(FRONTIER_SRC) || { echo "FRONTIER_SRC=$(FRONTIER_SRC) not found and image absent locally"; exit 1; }; \
+		test -d $(FRONTIER_SRC) || { echo "FRONTIER_SRC=$(FRONTIER_SRC) not found and local image is not for $(PLATFORM)"; exit 1; }; \
 		docker buildx build \
 			--platform $(PLATFORM) \
 			-t singchia/frontier:$(FRONTIER_VERSION) \
@@ -385,7 +387,7 @@ build-edge-bundle: ## [release] 打 ADR-024 edge upgrade bundle 到 dist/out/edg
 fetch-embedding-model: ## [release] 预拉 BGE 离线嵌入模型到 .cache/（幂等；package 会把它打进 tarball）
 	bash dist/fetch-embedding-model.sh
 
-.PHONY: check-release-target package
+.PHONY: check-release-target package package-all
 check-release-target:
 	@if [ "$(PLATFORM)" != "$(TARGET_OS)/$(TARGET_ARCH)" ]; then \
 		echo "PLATFORM=$(PLATFORM) does not match TARGET_OS/TARGET_ARCH=$(TARGET_OS)/$(TARGET_ARCH)"; \
@@ -408,8 +410,8 @@ check-release-target:
 # For offline RAG (ONGRID_EMBEDDING_PROVIDER=local) run
 # `make fetch-embedding-model` once before `make package`, otherwise
 # dist/package.sh warns and ships a tarball without the model.
-package: check-release-target fetch-promtail fetch-otelcol fetch-node-exporter fetch-process-exporter build-edge-all docker-build docker-build-broker docker-build-web ## [release] 打 release tarball 到 dist/out/
-	@rm -rf dist/stage dist/out
+package: check-release-target fetch-promtail fetch-otelcol fetch-node-exporter fetch-process-exporter build-edge-all docker-build docker-build-broker docker-build-web ## [release] 打单架构 release tarball 到 dist/out/（TARGET_ARCH 可覆盖）
+	@if [ "$(PACKAGE_CLEAN)" = "1" ]; then rm -rf dist/stage dist/out; fi
 	@mkdir -p dist/stage dist/out
 	@$(MAKE) --no-print-directory build-edge-bundle
 	PACKAGE_TARGET="$(PACKAGE_TARGET)" DOCKER_PLATFORM="$(PLATFORM)" bash dist/package.sh "$(VERSION)" "$(STAGE)" "$(OUT)"
@@ -419,6 +421,18 @@ package: check-release-target fetch-promtail fetch-otelcol fetch-node-exporter f
 	@if [ -f $(OUT)/ongrid-$(VERSION)-$(PACKAGE_TARGET).tar.xz.sha256 ]; then \
 		cat $(OUT)/ongrid-$(VERSION)-$(PACKAGE_TARGET).tar.xz.sha256; \
 	fi
+
+package-all: ## [release] 打 amd64 + arm64 两个生产安装包到 dist/out/
+	@rm -rf dist/stage dist/out
+	@mkdir -p dist/stage dist/out
+	@$(MAKE) --no-print-directory package TARGET_OS=linux TARGET_ARCH=amd64 PLATFORM=linux/amd64 PACKAGE_CLEAN=0
+	@$(MAKE) --no-print-directory package TARGET_OS=linux TARGET_ARCH=arm64 PLATFORM=linux/arm64 PACKAGE_CLEAN=0
+	@echo ""
+	@echo "=== release artefacts ==="
+	@ls -lh $(OUT)/ongrid-$(VERSION)-linux-amd64.tar.xz $(OUT)/ongrid-$(VERSION)-linux-arm64.tar.xz
+	@for f in $(OUT)/ongrid-$(VERSION)-linux-amd64.tar.xz.sha256 $(OUT)/ongrid-$(VERSION)-linux-arm64.tar.xz.sha256; do \
+		[ -f "$$f" ] && cat "$$f"; \
+	done
 
 .PHONY: dist-clean
 dist-clean: ## [release] 清理 release 产物（dist/stage dist/out bin/<os>-*）
