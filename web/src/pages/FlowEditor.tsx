@@ -39,9 +39,11 @@ import {
   getFlow,
   getFlowRun,
   listFlowRuns,
+  listFlowTools,
   runFlow,
   updateFlow,
   type Flow,
+  type FlowToolMeta,
   type FlowGraph,
   type FlowGraphNode,
   type FlowNodeType,
@@ -60,6 +62,23 @@ const NODE_META: Record<FlowNodeType, { icon: typeof Bot; color: string; zh: str
   condition: { icon: GitBranch, color: 'text-amber-400', zh: '条件', en: 'Condition' },
   notify: { icon: Bell, color: 'text-rose-400', zh: '通知', en: 'Notify' },
   set: { icon: Variable, color: 'text-zinc-400', zh: '变量', en: 'Set var' },
+};
+
+// Core nodes the user hand-places. `tool` is excluded here — tool nodes
+// come from the searchable catalog (every registered BaseTool), added via
+// addNode('tool', {config:{tool}}).
+const BASE_NODE_TYPES: FlowNodeType[] = ['trigger.manual', 'agent', 'condition', 'notify', 'set'];
+
+const CATEGORY_ORDER = ['observability', 'host', 'topology', 'incident', 'sre', 'knowledge', 'control', 'other'];
+const CATEGORY_LABEL: Record<string, { zh: string; en: string }> = {
+  observability: { zh: '可观测（指标/日志/链路）', en: 'Observability' },
+  host: { zh: '主机直达', en: 'Host' },
+  topology: { zh: '拓扑', en: 'Topology' },
+  incident: { zh: '告警 / 事件', en: 'Incidents' },
+  sre: { zh: '集群 / SRE', en: 'Fleet / SRE' },
+  knowledge: { zh: '知识 / 读码', en: 'Knowledge' },
+  control: { zh: '控制面', en: 'Control' },
+  other: { zh: '其他', en: 'Other' },
 };
 
 type CanvasData = {
@@ -220,6 +239,8 @@ export default function FlowEditorPage() {
   const [activeRun, setActiveRun] = useState<{ run: FlowRun; nodes: FlowRunNode[] } | null>(null);
   const seq = useRef(1);
   const pollRef = useRef<number | null>(null);
+  const [tools, setTools] = useState<FlowToolMeta[]>([]);
+  const [toolQuery, setToolQuery] = useState('');
 
   useEffect(() => {
     let alive = true;
@@ -246,8 +267,22 @@ export default function FlowEditorPage() {
     };
   }, [flowID, setNodes, setEdges]);
 
+  useEffect(() => {
+    let alive = true;
+    listFlowTools()
+      .then((r) => {
+        if (alive) setTools(r.items ?? []);
+      })
+      .catch(() => {
+        /* tools palette is best-effort; canvas works without it */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const addNode = useCallback(
-    (t: FlowNodeType) => {
+    (t: FlowNodeType, opts?: { label?: string; config?: Record<string, unknown> }) => {
       const meta = NODE_META[t];
       const nid = `n${seq.current++}`;
       setNodes((ns) => [
@@ -256,7 +291,11 @@ export default function FlowEditorPage() {
           id: nid,
           type: 'flowNode',
           position: { x: 120 + ns.length * 40, y: 120 + ns.length * 30 },
-          data: { flowType: t, label: locale === 'zh-CN' ? meta.zh : meta.en, config: {} },
+          data: {
+            flowType: t,
+            label: opts?.label ?? (locale === 'zh-CN' ? meta.zh : meta.en),
+            config: opts?.config ?? {},
+          },
         },
       ]);
       setSelectedID(nid);
@@ -443,24 +482,34 @@ export default function FlowEditorPage() {
       <div className="flex min-h-0 flex-1">
         {/* palette */}
         {canWrite && (
-          <div className="w-44 shrink-0 space-y-1 overflow-y-auto border-r border-zinc-800 p-2">
-            <div className="px-1 pb-1 text-[11px] uppercase tracking-wide text-zinc-600">{tr('节点', 'Nodes')}</div>
-            {(Object.keys(NODE_META) as FlowNodeType[]).map((t) => {
-              const meta = NODE_META[t];
-              const Icon = meta.icon;
-              return (
-                <button
-                  key={t}
-                  type="button"
-                  onClick={() => addNode(t)}
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-zinc-300 transition-colors hover:bg-zinc-800"
-                >
-                  <Icon size={14} className={meta.color} />
-                  {locale === 'zh-CN' ? meta.zh : meta.en}
-                </button>
-              );
-            })}
-            <div className="px-1 pt-3 text-[11px] leading-relaxed text-zinc-600">
+          <div className="flex w-52 shrink-0 flex-col overflow-hidden border-r border-zinc-800">
+            <div className="space-y-1 p-2">
+              <div className="px-1 pb-1 text-[11px] uppercase tracking-wide text-zinc-600">{tr('基础节点', 'Core nodes')}</div>
+              {BASE_NODE_TYPES.map((t) => {
+                const meta = NODE_META[t];
+                const Icon = meta.icon;
+                return (
+                  <button
+                    key={t}
+                    type="button"
+                    onClick={() => addNode(t)}
+                    className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-zinc-300 transition-colors hover:bg-zinc-800"
+                  >
+                    <Icon size={14} className={meta.color} />
+                    {locale === 'zh-CN' ? meta.zh : meta.en}
+                  </button>
+                );
+              })}
+            </div>
+            <ToolPalette
+              tools={tools}
+              query={toolQuery}
+              onQuery={setToolQuery}
+              onPick={(t) =>
+                addNode('tool', { label: t.name, config: { tool: t.name, args: {} } })
+              }
+            />
+            <div className="border-t border-zinc-800 px-3 py-2 text-[11px] leading-relaxed text-zinc-600">
               {tr(
                 '连线 = 控制流。数据用 {{nodes.<id>.output.<字段>}} 引用上游。',
                 'Edges are control flow. Reference upstream data via {{nodes.<id>.output.<field>}}.'
@@ -522,15 +571,25 @@ export default function FlowEditorPage() {
                 className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1.5 text-[13px] text-zinc-200 outline-none focus:border-indigo-500"
               />
             </label>
-            {CONFIG_FIELDS[selected.data.flowType].map((f) => (
-              <ConfigField
-                key={f.key}
-                spec={f}
-                value={selected.data.config[f.key]}
+            {selected.data.flowType === 'tool' ? (
+              <ToolArgsForm
+                toolName={(selected.data.config.tool as string) || ''}
+                args={(selected.data.config.args as Record<string, unknown>) || {}}
+                schema={tools.find((t) => t.name === selected.data.config.tool)}
                 disabled={!canWrite}
-                onChange={(v) => patchSelected({ config: { ...selected.data.config, [f.key]: v } })}
+                onChange={(args) => patchSelected({ config: { ...selected.data.config, args } })}
               />
-            ))}
+            ) : (
+              CONFIG_FIELDS[selected.data.flowType].map((f) => (
+                <ConfigField
+                  key={f.key}
+                  spec={f}
+                  value={selected.data.config[f.key]}
+                  disabled={!canWrite}
+                  onChange={(v) => patchSelected({ config: { ...selected.data.config, [f.key]: v } })}
+                />
+              ))
+            )}
             <div className="mt-2 rounded-md bg-zinc-900/60 p-2 text-[11px] leading-relaxed text-zinc-500">
               {selected.data.flowType === 'agent'
                 ? tr(
@@ -681,5 +740,168 @@ function ConfigField({
         />
       )}
     </label>
+  );
+}
+
+
+// ToolPalette — searchable, category-grouped list of every registered
+// BaseTool. Picking one drops a tool node pre-filled with that tool name.
+function ToolPalette({
+  tools,
+  query,
+  onQuery,
+  onPick,
+}: {
+  tools: FlowToolMeta[];
+  query: string;
+  onQuery: (q: string) => void;
+  onPick: (t: FlowToolMeta) => void;
+}) {
+  const { tr, locale } = useI18n();
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return tools;
+    return tools.filter((t) => t.name.toLowerCase().includes(q) || t.description.toLowerCase().includes(q));
+  }, [tools, query]);
+  const byCat = useMemo(() => {
+    const m = new Map<string, FlowToolMeta[]>();
+    for (const t of filtered) {
+      const c = t.category || 'other';
+      if (!m.has(c)) m.set(c, []);
+      m.get(c)!.push(t);
+    }
+    return m;
+  }, [filtered]);
+  const cats = CATEGORY_ORDER.filter((c) => byCat.has(c));
+
+  return (
+    <div className="flex min-h-0 flex-1 flex-col border-t border-zinc-800">
+      <div className="flex items-center justify-between px-3 pt-2">
+        <span className="text-[11px] uppercase tracking-wide text-zinc-600">
+          {tr('工具', 'Tools')} {tools.length > 0 ? `(${tools.length})` : ''}
+        </span>
+      </div>
+      <div className="px-2 py-1.5">
+        <input
+          value={query}
+          onChange={(e) => onQuery(e.target.value)}
+          placeholder={tr('搜索工具…', 'Search tools…')}
+          className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1 text-[12px] text-zinc-200 outline-none focus:border-indigo-500"
+        />
+      </div>
+      <div className="min-h-0 flex-1 overflow-y-auto px-1 pb-2">
+        {tools.length === 0 ? (
+          <div className="px-2 py-3 text-[11px] leading-relaxed text-zinc-600">
+            {tr('工具目录为空（LLM 运行时未就绪）。', 'Tool catalog empty (LLM runtime not ready).')}
+          </div>
+        ) : cats.length === 0 ? (
+          <div className="px-2 py-3 text-[11px] text-zinc-600">{tr('无匹配', 'No match')}</div>
+        ) : (
+          cats.map((cat) => (
+            <div key={cat} className="mb-1">
+              <div className="px-2 pt-2 text-[10px] uppercase tracking-wide text-zinc-600">
+                {locale === 'zh-CN' ? CATEGORY_LABEL[cat]?.zh : CATEGORY_LABEL[cat]?.en}
+              </div>
+              {byCat.get(cat)!.map((t) => (
+                <button
+                  key={t.name}
+                  type="button"
+                  title={t.description + (t.when_to_use ? '\n\n' + t.when_to_use : '')}
+                  onClick={() => onPick(t)}
+                  className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-[12px] text-zinc-300 transition-colors hover:bg-zinc-800"
+                >
+                  <Wrench size={12} className="shrink-0 text-sky-400/80" />
+                  <span className="truncate font-mono text-[11px]">{t.name}</span>
+                  {t.class !== 'read' && (
+                    <span className="ml-auto shrink-0 rounded bg-amber-900/40 px-1 text-[9px] text-amber-400">
+                      {t.class === 'destructive' ? tr('危', 'D') : tr('写', 'W')}
+                    </span>
+                  )}
+                </button>
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ToolArgsForm — renders a tool node's args as a typed form driven by the
+// tool's JSON Schema. Falls back to a raw JSON textarea when the schema
+// is unknown (catalog not loaded / custom tool). Values accept {{...}}
+// templates, so every field stays a string in config.args.
+function ToolArgsForm({
+  toolName,
+  args,
+  schema,
+  disabled,
+  onChange,
+}: {
+  toolName: string;
+  args: Record<string, unknown>;
+  schema?: FlowToolMeta;
+  disabled: boolean;
+  onChange: (args: Record<string, unknown>) => void;
+}) {
+  const { tr } = useI18n();
+  const props = schema?.parameters?.properties;
+  const required = new Set(schema?.parameters?.required ?? []);
+
+  if (!props || Object.keys(props).length === 0) {
+    // Unknown schema → raw JSON editor.
+    return (
+      <ConfigField
+        spec={{ key: 'args', zh: '参数（JSON，值支持 {{…}}）', en: 'Args (JSON; values accept {{…}})', kind: 'json' }}
+        value={args}
+        disabled={disabled}
+        onChange={(v) => onChange((v as Record<string, unknown>) ?? {})}
+      />
+    );
+  }
+
+  return (
+    <div>
+      <div className="mb-2 rounded-md bg-zinc-900/60 p-2 text-[11px] leading-relaxed text-zinc-500">
+        {schema?.description}
+      </div>
+      {Object.entries(props).map(([key, spec]) => {
+        const val = (args[key] as string) ?? '';
+        const isEnum = Array.isArray(spec.enum) && spec.enum.length > 0;
+        return (
+          <label key={key} className="mb-3 block">
+            <span className="mb-1 block text-[12px] text-zinc-500">
+              <span className="font-mono text-zinc-400">{key}</span>
+              {required.has(key) && <span className="ml-1 text-red-400">*</span>}
+              {spec.description ? <span className="ml-1 text-zinc-600">— {spec.description}</span> : null}
+            </span>
+            {isEnum ? (
+              <select
+                value={val}
+                disabled={disabled}
+                onChange={(e) => onChange({ ...args, [key]: e.target.value })}
+                className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1.5 text-[13px] text-zinc-200 outline-none focus:border-indigo-500"
+              >
+                <option value="">{tr('（不设置）', '(unset)')}</option>
+                {(spec.enum as unknown[]).map((o) => (
+                  <option key={String(o)} value={String(o)}>
+                    {String(o)}
+                  </option>
+                ))}
+              </select>
+            ) : (
+              <input
+                value={val}
+                disabled={disabled}
+                placeholder={spec.type === 'number' || spec.type === 'integer' ? '123 / {{…}}' : '{{…}}'}
+                onChange={(e) => onChange({ ...args, [key]: e.target.value })}
+                className="w-full rounded-md border border-zinc-800 bg-zinc-950 px-2 py-1.5 font-mono text-[12px] text-zinc-200 outline-none focus:border-indigo-500"
+              />
+            )}
+          </label>
+        );
+      })}
+      <div className="mt-1 text-[11px] text-zinc-600">{tr('工具', 'Tool')}: <span className="font-mono">{toolName}</span></div>
+    </div>
   );
 }

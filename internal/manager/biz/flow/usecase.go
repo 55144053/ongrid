@@ -44,10 +44,11 @@ type RunRepo interface {
 
 // Usecase wires definitions, runs and the engine.
 type Usecase struct {
-	repo   Repo
-	runs   RunRepo
-	engine *Engine
-	log    *slog.Logger
+	repo    Repo
+	runs    RunRepo
+	engine  *Engine
+	catalog ToolCatalog
+	log     *slog.Logger
 }
 
 // NewUsecase constructs the biz facade. engine may be nil in tests

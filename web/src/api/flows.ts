@@ -113,3 +113,25 @@ export function listFlowRuns(id: number, limit = 20) {
 export function getFlowRun(runId: string) {
   return request<{ run: FlowRun; nodes: FlowRunNode[] }>('GET', `/flow-runs/${runId}`);
 }
+
+// ---------- tool catalog (palette source) ---------------------------------
+
+// One registered BaseTool, surfaced as a draggable tool-node preset.
+// parameters is the tool's JSON Schema (object with `properties`), used
+// to render a typed arg form in the config drawer.
+export type FlowToolMeta = {
+  name: string;
+  description: string;
+  when_to_use?: string;
+  class: string; // read / write / destructive
+  category: string;
+  parameters?: {
+    type?: string;
+    properties?: Record<string, { type?: string; description?: string; enum?: unknown[] }>;
+    required?: string[];
+  };
+};
+
+export function listFlowTools() {
+  return request<{ items: FlowToolMeta[] }>('GET', '/flow-tools');
+}

@@ -39,6 +39,7 @@ func (h *Handler) Register(r chi.Router) {
 	r.With(h.requireWriter).Post("/v1/flows/{id}/run", h.run)
 	r.Get("/v1/flows/{id}/runs", h.listRuns)
 	r.Get("/v1/flow-runs/{run_id}", h.getRun)
+	r.Get("/v1/flow-tools", h.listTools)
 }
 
 func (h *Handler) requireWriter(next http.Handler) http.Handler {
@@ -318,6 +319,38 @@ func (h *Handler) getRun(w http.ResponseWriter, r *http.Request) {
 		nds = append(nds, d)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"run": toRunDTO(run), "nodes": nds})
+}
+
+type toolMetaDTO struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	WhenToUse   string          `json:"when_to_use,omitempty"`
+	Class       string          `json:"class"`
+	Category    string          `json:"category"`
+	Parameters  json.RawMessage `json:"parameters,omitempty"`
+}
+
+// listTools returns the tool-node palette (every registered BaseTool as
+// a draggable, form-driven node source). Read-open to any authed user
+// since the editor needs it; an empty list means the tools runtime
+// isn't wired (LLM provider absent) — the canvas degrades gracefully.
+func (h *Handler) listTools(w http.ResponseWriter, r *http.Request) {
+	if !h.authed(w, r) {
+		return
+	}
+	metas := h.uc.ListTools()
+	items := make([]toolMetaDTO, 0, len(metas))
+	for _, m := range metas {
+		items = append(items, toolMetaDTO{
+			Name:        m.Name,
+			Description: m.Description,
+			WhenToUse:   m.WhenToUse,
+			Class:       m.Class,
+			Category:    m.Category,
+			Parameters:  m.Parameters,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
 
 // --- helpers (mirror server/report) ---

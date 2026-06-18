@@ -1561,7 +1561,8 @@ func main() {
 		flowExec.Agent = flowAgentRunner{rt: flowRT}
 	}
 	flowUC := managerbizflow.NewUsecase(flowRepo, flowRunRepo,
-		managerbizflow.NewEngine(flowExec, flowRunRepo, log), log)
+		managerbizflow.NewEngine(flowExec, flowRunRepo, log), log).
+		WithToolCatalog(flowToolCatalog{reg: toolsReg})
 	flowUC.HealStaleRuns(rootCtx)
 	flowHandler := managerserverflow.NewHandler(flowUC)
 	log.Info("flow: orchestration wired")
@@ -3124,4 +3125,97 @@ func (s flowNotifierShim) Notify(ctx context.Context, channelIDs []uint64, title
 		return firstErr
 	}
 	return nil
+}
+
+// flowToolCatalog implements bizflow.ToolCatalog over the aiops tool
+// registry — surfaces every registered BaseTool to the canvas palette so
+// each becomes a draggable, form-driven `tool` node. Rebuilds the bag per
+// call (cheap, low-frequency: editor load) so newly registered tools show
+// up without a restart.
+type flowToolCatalog struct{ reg *aiopstools.Registry }
+
+func (c flowToolCatalog) ListTools() []managerbizflow.ToolMeta {
+	bag := c.reg.BuildBaseTools()
+	if bag == nil {
+		return nil
+	}
+	all := bag.AllTools()
+	out := make([]managerbizflow.ToolMeta, 0, len(all))
+	ctx := context.Background()
+	for _, t := range all {
+		if t == nil {
+			continue
+		}
+		info, err := t.Info(ctx)
+		if err != nil || info == nil || info.Name == "" {
+			continue
+		}
+		// Control-plane tools don't belong in a workflow tool node:
+		// AgentTool overlaps the dedicated `agent` node, SendMessage /
+		// TaskStop steer a live coordinator session, ToolSearch is an
+		// LLM-only schema-fetch affordance. Hide them from the palette.
+		if isControlPlaneTool(info.Name) {
+			continue
+		}
+		out = append(out, managerbizflow.ToolMeta{
+			Name:        info.Name,
+			Description: info.Description,
+			WhenToUse:   info.WhenToUse,
+			Class:       info.Class,
+			Category:    categorizeFlowTool(info.Name),
+			Parameters:  info.Parameters,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Category != out[j].Category {
+			return out[i].Category < out[j].Category
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+// isControlPlaneTool reports whether a tool is the coordinator's
+// sub-agent control surface — excluded from the workflow palette. Names
+// are the registered (CamelCase) forms.
+func isControlPlaneTool(name string) bool {
+	switch name {
+	case "AgentTool", "SendMessage", "TaskStop", "ToolSearch":
+		return true
+	}
+	return false
+}
+
+// categorizeFlowTool buckets a tool name into a palette group. Explicit
+// map for the hand-written tools, prefix rules for the families; unknown
+// names fall to "other" so the palette never drops a tool.
+func categorizeFlowTool(name string) string {
+	switch name {
+	case "correlate_incident", "get_incident_detail", "query_incidents", "query_alert_rules":
+		return "incident"
+	case "get_edge_summary", "query_devices", "query_edges", "query_change_events", "rank_edges", "find_outlier_edges":
+		return "sre"
+	case "get_topology", "find_topology_node", "expand_topology":
+		return "topology"
+	case "query_knowledge", "list_repo_sources", "read_source", "grep_source":
+		return "knowledge"
+	case "list_database_sources", "analyze_database_status":
+		return "observability"
+	case "agent_tool", "send_message", "task_stop", "tool_search":
+		return "control"
+	}
+	switch {
+	case strings.HasPrefix(name, "query_"):
+		return "observability"
+	case strings.HasPrefix(name, "host_") || strings.HasPrefix(name, "get_host_") || strings.Contains(name, "restart_service"):
+		return "host"
+	case strings.Contains(name, "topology"):
+		return "topology"
+	case strings.Contains(name, "incident") || strings.Contains(name, "alert"):
+		return "incident"
+	case strings.Contains(name, "source") || strings.Contains(name, "knowledge"):
+		return "knowledge"
+	default:
+		return "other"
+	}
 }
