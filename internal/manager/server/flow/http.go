@@ -41,6 +41,7 @@ func (h *Handler) Register(r chi.Router) {
 	r.Get("/v1/flows/{id}/runs", h.listRuns)
 	r.Get("/v1/flow-runs/{run_id}", h.getRun)
 	r.Get("/v1/flow-tools", h.listTools)
+	r.Get("/v1/flow-node-types", h.listNodeTypes)
 }
 
 func (h *Handler) requireWriter(next http.Handler) http.Handler {
@@ -380,6 +381,41 @@ func (h *Handler) listTools(w http.ResponseWriter, r *http.Request) {
 			Class:         m.Class,
 			Category:      m.Category,
 			Parameters:    m.Parameters,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+type nodeTypeDTO struct {
+	Type         string                    `json:"type"`
+	Kind         string                    `json:"kind"`
+	Category     string                    `json:"category"`
+	LabelZh      string                    `json:"label_zh"`
+	LabelEn      string                    `json:"label_en"`
+	Ports        []string                  `json:"ports"`
+	ConfigFields []bizflow.ConfigFieldSpec `json:"config_fields"`
+	OutputShape  []string                  `json:"output_shape"`
+}
+
+// listNodeTypes returns every registered node-type spec so the editor can
+// render the palette + config drawer from data, not hardcoded tables.
+// Read-open to any authed user.
+func (h *Handler) listNodeTypes(w http.ResponseWriter, r *http.Request) {
+	if !h.authed(w, r) {
+		return
+	}
+	specs := h.uc.ListNodeTypes()
+	items := make([]nodeTypeDTO, 0, len(specs))
+	for _, s := range specs {
+		items = append(items, nodeTypeDTO{
+			Type:         s.Type,
+			Kind:         string(s.Kind),
+			Category:     s.Category,
+			LabelZh:      s.LabelZh,
+			LabelEn:      s.LabelEn,
+			Ports:        s.Ports,
+			ConfigFields: s.ConfigFields,
+			OutputShape:  s.OutputShape,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items})

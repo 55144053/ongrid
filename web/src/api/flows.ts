@@ -152,3 +152,32 @@ export function testFlowNode(
 ) {
   return request<{ output?: unknown; error?: string }>('POST', `/flows/${flowId}/test-node`, body);
 }
+
+// ---------- node-type catalog (palette + config drawer, data-driven) ------
+
+export type NodeConfigField = {
+  key: string;
+  label_zh: string;
+  label_en: string;
+  kind: 'text' | 'textarea' | 'json' | 'select';
+  placeholder?: string;
+  options?: string[];
+};
+
+// A registered node type, surfaced so the editor renders palette + config
+// from data instead of a hardcoded table. The frontend keeps only a
+// type→icon/color visual map.
+export type NodeType = {
+  type: FlowNodeType;
+  kind: 'trigger' | 'action' | 'control' | 'data';
+  category: string;
+  label_zh: string;
+  label_en: string;
+  ports: string[];
+  config_fields: NodeConfigField[];
+  output_shape: string[];
+};
+
+export function listNodeTypes() {
+  return request<{ items: NodeType[] }>('GET', '/flow-node-types');
+}

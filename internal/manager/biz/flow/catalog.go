@@ -47,3 +47,9 @@ func (u *Usecase) ListTools() []ToolMeta {
 	}
 	return u.catalog.ListTools()
 }
+
+// ListNodeTypes returns every registered node-type spec — the frontend
+// renders the palette + config drawer from these instead of hardcoding.
+func (u *Usecase) ListNodeTypes() []*NodeSpec {
+	return AllNodeSpecs()
+}

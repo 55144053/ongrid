@@ -32,13 +32,31 @@ const (
 // registered globally.
 type ExecuteFunc func(ctx context.Context, x Executors, cfg map[string]any, rc *RunContext) (NodeResult, error)
 
-// NodeSpec is the complete declaration of one node type.
+// ConfigFieldSpec declares one config form field — the frontend renders
+// the config drawer from these instead of hardcoding per type.
+type ConfigFieldSpec struct {
+	Key         string   `json:"key"`
+	LabelZh     string   `json:"label_zh"`
+	LabelEn     string   `json:"label_en"`
+	Kind        string   `json:"kind"` // text / textarea / json / select
+	Placeholder string   `json:"placeholder,omitempty"`
+	Options     []string `json:"options,omitempty"` // for kind=select
+}
+
+// NodeSpec is the complete declaration of one node type — structural
+// behaviour, palette presentation, config form, and output shape. The
+// engine, validator, AND frontend all derive from it (the frontend keeps
+// only a type→icon/color visual map).
 type NodeSpec struct {
-	Type     string      // wire type ("tool" / "llm" / "transform")
-	Kind     NodeKind    // structural behaviour
-	Category string      // palette grouping (intent-based)
-	Ports    []string    // control output ports (default [next]; condition=[true,false])
-	Execute  ExecuteFunc // executor
+	Type         string            // wire type ("tool" / "llm" / "transform")
+	Kind         NodeKind          // structural behaviour
+	Category     string            // palette grouping (intent-based)
+	LabelZh      string            // display name (zh)
+	LabelEn      string            // display name (en)
+	Ports        []string          // control output ports (default [next]; condition=[true,false])
+	ConfigFields []ConfigFieldSpec // config form fields (empty for tool: args come from BaseTool schema)
+	OutputShape  []string          // static output field paths ([] when dynamic, e.g. transform/agent)
+	Execute      ExecuteFunc       // executor
 }
 
 var nodeRegistry = map[string]*NodeSpec{}
@@ -72,16 +90,96 @@ func init() { registerBuiltins() }
 // dynamically-discovered types (tools come from BaseTool schemas) keep the
 // single `tool` spec and select via config.tool.
 func registerBuiltins() {
-	RegisterNode(&NodeSpec{Type: NodeTriggerManual, Kind: KindTrigger, Category: "trigger", Execute: execTrigger})
-	RegisterNode(&NodeSpec{Type: NodeTriggerAlert, Kind: KindTrigger, Category: "trigger", Execute: execTrigger})
-	RegisterNode(&NodeSpec{Type: NodeTriggerCron, Kind: KindTrigger, Category: "trigger", Execute: execTrigger})
-	RegisterNode(&NodeSpec{Type: NodeAgent, Kind: KindAction, Category: "ai", Execute: execAgent})
-	RegisterNode(&NodeSpec{Type: NodeLLM, Kind: KindAction, Category: "ai", Execute: execLLM})
-	RegisterNode(&NodeSpec{Type: NodeTool, Kind: KindAction, Category: "action", Execute: execTool})
-	RegisterNode(&NodeSpec{Type: NodeCondition, Kind: KindControl, Category: "flow", Ports: []string{PortTrue, PortFalse}, Execute: execCondition})
-	RegisterNode(&NodeSpec{Type: NodeNotify, Kind: KindAction, Category: "action", Execute: execNotify})
-	RegisterNode(&NodeSpec{Type: NodeSet, Kind: KindData, Category: "data", Execute: execSet})
-	RegisterNode(&NodeSpec{Type: NodeTransform, Kind: KindData, Category: "data", Execute: execTransform})
+	RegisterNode(&NodeSpec{
+		Type: NodeTriggerManual, Kind: KindTrigger, Category: "trigger",
+		LabelZh: "手动触发", LabelEn: "Manual trigger", Execute: execTrigger,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeTriggerAlert, Kind: KindTrigger, Category: "trigger",
+		LabelZh: "告警触发", LabelEn: "On alert",
+		ConfigFields: []ConfigFieldSpec{
+			{Key: "rule", LabelZh: "规则名包含（留空=所有告警）", LabelEn: "Rule name contains (blank = all alerts)", Kind: "text", Placeholder: "如 disk / cpu"},
+			{Key: "min_severity", LabelZh: "最低严重度（warning/error/critical，留空=不限）", LabelEn: "Min severity (warning/error/critical; blank = any)", Kind: "text", Placeholder: "critical"},
+		},
+		OutputShape: []string{"incident_id", "rule", "severity", "edge_id", "device_id", "labels", "fired_at"},
+		Execute:     execTrigger,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeTriggerCron, Kind: KindTrigger, Category: "trigger",
+		LabelZh: "定时触发", LabelEn: "On schedule",
+		ConfigFields: []ConfigFieldSpec{
+			{Key: "cron", LabelZh: "定时表达式（标准 5 段 cron，UTC）", LabelEn: "Cron schedule (standard 5-field, UTC)", Kind: "text", Placeholder: "0 8 * * *  (每天 UTC 08:00)"},
+		},
+		OutputShape: []string{"fired_at", "cron"},
+		Execute:     execTrigger,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeAgent, Kind: KindAction, Category: "ai",
+		LabelZh: "Agent（自主）", LabelEn: "Agent",
+		ConfigFields: []ConfigFieldSpec{
+			{Key: "persona", LabelZh: "角色 (persona)", LabelEn: "Persona", Kind: "text", Placeholder: "default / specialist-network / …"},
+			{Key: "instruction", LabelZh: "指令（支持 {{…}} 模板）", LabelEn: "Instruction ({{…}} templates)", Kind: "textarea", Placeholder: "诊断 {{trigger.host}} 上的磁盘告警…"},
+			{Key: "output_schema", LabelZh: "输出 schema（可选，JSON Schema。声明后下游才能引用 structured 字段）", LabelEn: "Output schema (optional; required for structured downstream refs)", Kind: "json"},
+		},
+		OutputShape: []string{"answer"},
+		Execute:     execAgent,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeLLM, Kind: KindAction, Category: "ai",
+		LabelZh: "LLM（单次）", LabelEn: "LLM",
+		ConfigFields: []ConfigFieldSpec{
+			{Key: "system", LabelZh: "系统提示（可选）", LabelEn: "System prompt (optional)", Kind: "textarea", Placeholder: "你是运维助手，简洁回答。"},
+			{Key: "prompt", LabelZh: "提示词（支持 {{…}} 模板）", LabelEn: "Prompt ({{…}} templates)", Kind: "textarea", Placeholder: "把这段诊断总结成一句话：{{nodes.diag.output.answer}}"},
+			{Key: "output_schema", LabelZh: "输出 schema（可选，JSON Schema。声明后下游才能引用 structured 字段）", LabelEn: "Output schema (optional; required for structured downstream refs)", Kind: "json"},
+		},
+		OutputShape: []string{"answer"},
+		Execute:     execLLM,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeTool, Kind: KindAction, Category: "action",
+		LabelZh: "工具", LabelEn: "Tool",
+		OutputShape: []string{"result"}, // args form comes from the BaseTool schema, not ConfigFields
+		Execute:     execTool,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeCondition, Kind: KindControl, Category: "flow",
+		LabelZh: "条件", LabelEn: "Condition", Ports: []string{PortTrue, PortFalse},
+		ConfigFields: []ConfigFieldSpec{
+			{Key: "expr", LabelZh: "表达式", LabelEn: "Expression", Kind: "text", Placeholder: `{{nodes.diag.output.structured.severity}} == "critical"`},
+		},
+		OutputShape: []string{"result"},
+		Execute:     execCondition,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeNotify, Kind: KindAction, Category: "action",
+		LabelZh: "通知", LabelEn: "Notify",
+		ConfigFields: []ConfigFieldSpec{
+			{Key: "channel_ids", LabelZh: "渠道 ID（JSON 数组）", LabelEn: "Channel ids (JSON array)", Kind: "json", Placeholder: "[1]"},
+			{Key: "title", LabelZh: "标题", LabelEn: "Title", Kind: "text"},
+			{Key: "message", LabelZh: "内容（支持 {{…}}）", LabelEn: "Message ({{…}} templates)", Kind: "textarea"},
+		},
+		OutputShape: []string{"sent", "channels"},
+		Execute:     execNotify,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeSet, Kind: KindData, Category: "data",
+		LabelZh: "变量", LabelEn: "Set var",
+		ConfigFields: []ConfigFieldSpec{
+			{Key: "name", LabelZh: "变量名", LabelEn: "Variable name", Kind: "text"},
+			{Key: "value", LabelZh: "值（支持 {{…}}）", LabelEn: "Value ({{…}} templates)", Kind: "text"},
+		},
+		OutputShape: []string{"name", "value"},
+		Execute:     execSet,
+	})
+	RegisterNode(&NodeSpec{
+		Type: NodeTransform, Kind: KindData, Category: "data",
+		LabelZh: "字段映射", LabelEn: "Edit Fields",
+		ConfigFields: []ConfigFieldSpec{
+			{Key: "fields", LabelZh: "字段映射（JSON，每个字段值支持 {{…}}）。把上游数据重组成下游需要的字段。", LabelEn: "Field mapping (JSON; each value accepts {{…}}). Reshape upstream data into the fields a downstream node needs.", Kind: "json"},
+		},
+		// OutputShape dynamic (the declared field names); frontend reads config.fields keys.
+		Execute: execTransform,
+	})
 }
 
 // --- built-in executors (migrated verbatim from the old execute switch) ---

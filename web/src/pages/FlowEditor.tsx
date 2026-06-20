@@ -45,11 +45,13 @@ import {
   getFlowRun,
   listFlowRuns,
   listFlowTools,
+  listNodeTypes,
   runFlow,
   testFlowNode,
   updateFlow,
   type Flow,
   type FlowToolMeta,
+  type NodeType,
   type FlowGraph,
   type FlowGraphNode,
   type FlowNodeType,
@@ -257,6 +259,51 @@ const CONFIG_FIELDS: Record<FlowNodeType, FieldSpec[]> = {
   ],
 };
 
+// ---------- data-driven node metadata ------------------------------------
+// Node label / config form / output shape come from the backend NodeSpec
+// registry (GET /v1/flow-node-types). The built-in NODE_META / CONFIG_FIELDS
+// tables remain only as a visual map (icon/color) and a graceful fallback
+// if the node-types fetch hasn't landed.
+
+function nodeLabelOf(type: FlowNodeType, locale: string, nodeTypes: Record<string, NodeType>): string {
+  const nt = nodeTypes[type];
+  if (nt) return locale === 'zh-CN' ? nt.label_zh : nt.label_en;
+  const m = NODE_META[type];
+  return m ? (locale === 'zh-CN' ? m.zh : m.en) : type;
+}
+
+function configFieldsFor(type: FlowNodeType, nodeTypes: Record<string, NodeType>): FieldSpec[] {
+  const nt = nodeTypes[type];
+  if (nt && nt.config_fields?.length) {
+    return nt.config_fields.map((f) => ({
+      key: f.key,
+      zh: f.label_zh,
+      en: f.label_en,
+      kind: f.kind === 'select' ? 'text' : f.kind,
+      placeholder: f.placeholder,
+    }));
+  }
+  return CONFIG_FIELDS[type] ?? [];
+}
+
+// baseNodeTypesFrom derives the hand-placed node palette from the backend
+// (every registered type except `tool`, which has its own catalog),
+// grouped by kind. Falls back to the static BASE_NODE_TYPES list.
+function baseNodeTypesFrom(nodeTypes: Record<string, NodeType>): FlowNodeType[] {
+  const all = Object.values(nodeTypes).filter((nt) => nt.type !== 'tool');
+  if (all.length === 0) return BASE_NODE_TYPES;
+  const kindOrder = ['trigger', 'ai', 'action', 'control', 'flow', 'data'];
+  return all
+    .slice()
+    .sort((a, b) => {
+      const ka = kindOrder.indexOf(a.category);
+      const kb = kindOrder.indexOf(b.category);
+      if (ka !== kb) return (ka < 0 ? 99 : ka) - (kb < 0 ? 99 : kb);
+      return a.type.localeCompare(b.type);
+    })
+    .map((nt) => nt.type);
+}
+
 // ---------- page -----------------------------------------------------------
 
 export default function FlowEditorPage() {
@@ -287,6 +334,7 @@ export default function FlowEditorPage() {
   const rfRef = useRef<ReactFlowInstance<CanvasNode, Edge> | null>(null);
   const [tools, setTools] = useState<FlowToolMeta[]>([]);
   const [toolQuery, setToolQuery] = useState('');
+  const [nodeSpecs, setNodeSpecs] = useState<Record<string, NodeType>>({});
 
   useEffect(() => {
     let alive = true;
@@ -349,6 +397,23 @@ export default function FlowEditorPage() {
     };
   }, []);
 
+  useEffect(() => {
+    let alive = true;
+    listNodeTypes()
+      .then((r) => {
+        if (!alive) return;
+        const m: Record<string, NodeType> = {};
+        for (const nt of r.items ?? []) m[nt.type] = nt;
+        setNodeSpecs(m);
+      })
+      .catch(() => {
+        /* falls back to the built-in NODE_META / CONFIG_FIELDS tables */
+      });
+    return () => {
+      alive = false;
+    };
+  }, []);
+
   const addNode = useCallback(
     (t: FlowNodeType, opts?: { label?: string; config?: Record<string, unknown> }) => {
       const meta = NODE_META[t];
@@ -362,7 +427,7 @@ export default function FlowEditorPage() {
           position: pos,
           data: {
             flowType: t,
-            label: opts?.label ?? (locale === 'zh-CN' ? meta.zh : meta.en),
+            label: opts?.label ?? nodeLabelOf(t, locale, nodeSpecs),
             config: opts?.config ?? {},
           },
         },
@@ -375,7 +440,7 @@ export default function FlowEditorPage() {
         if (inst) inst.setCenter(pos.x + 75, pos.y + 16, { zoom: inst.getZoom(), duration: 400 });
       }, 30);
     },
-    [nodes.length, locale, setNodes]
+    [nodes.length, locale, nodeSpecs, setNodes]
   );
 
   const onConnect = useCallback(
@@ -583,9 +648,9 @@ export default function FlowEditorPage() {
           <div className="flex w-52 shrink-0 flex-col overflow-hidden border-r border-zinc-800">
             <div className="space-y-1 p-2">
               <div className="px-1 pb-1 text-[11px] uppercase tracking-wide text-zinc-600">{tr('基础节点', 'Core nodes')}</div>
-              {BASE_NODE_TYPES.map((t) => {
+              {baseNodeTypesFrom(nodeSpecs).map((t) => {
                 const meta = NODE_META[t];
-                const Icon = meta.icon;
+                const Icon = meta?.icon ?? Wrench;
                 return (
                   <button
                     key={t}
@@ -594,7 +659,7 @@ export default function FlowEditorPage() {
                     className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[12px] text-zinc-300 transition-colors hover:bg-zinc-800"
                   >
                     <Icon size={14} className={meta.color} />
-                    {locale === 'zh-CN' ? meta.zh : meta.en}
+                    {nodeLabelOf(t, locale, nodeSpecs)}
                   </button>
                 );
               })}
@@ -688,7 +753,7 @@ export default function FlowEditorPage() {
                 onChange={(args) => patchSelected({ config: { ...selected.data.config, args } })}
               />
             ) : (
-              CONFIG_FIELDS[selected.data.flowType].map((f) => (
+              configFieldsFor(selected.data.flowType, nodeSpecs).map((f) => (
                 <ConfigField
                   key={f.key}
                   spec={f}
