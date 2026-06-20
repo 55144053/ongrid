@@ -837,6 +837,7 @@ export default function FlowEditorPage() {
                 />
               ))
             )}
+            <ReferencedData config={selected.data.config} nodes={nodes} />
             {!selected.data.flowType.startsWith('trigger.') && (
               <UpstreamRefs
                 selectedId={selected.id}
@@ -1387,6 +1388,97 @@ function previewValue(v: unknown): string {
   return s.length > 48 ? `${s.slice(0, 48)}…` : s;
 }
 
+// --- friendly references (HLD-016 step 1) -------------------------------
+// Storage stays canonical ({{nodes.<id>.output.<path>}}); these helpers are
+// the DISPLAY/authoring layer that turns a cryptic path into a name a user
+// reads at a glance ("主机负载 › CPU 使用率"). Step 2 (pills) renders over the
+// same mapping. FIELD_LABELS hand-labels the common leaves; everything else
+// falls back to a prettified last segment.
+const FIELD_LABELS: Record<string, { zh: string; en: string }> = {
+  cpu_pct: { zh: 'CPU 使用率', en: 'CPU %' },
+  mem_pct: { zh: '内存使用率', en: 'Memory %' },
+  disk_used_pct: { zh: '磁盘使用率', en: 'Disk %' },
+  load1: { zh: '1 分钟负载', en: 'Load 1m' },
+  load5: { zh: '5 分钟负载', en: 'Load 5m' },
+  load15: { zh: '15 分钟负载', en: 'Load 15m' },
+  sampled_at: { zh: '采样时间', en: 'Sampled at' },
+  fired_at: { zh: '触发时间', en: 'Fired at' },
+  device_id: { zh: '设备 ID', en: 'Device ID' },
+  device_ids: { zh: '设备 ID 列表', en: 'Device IDs' },
+  edge_id: { zh: 'Edge ID', en: 'Edge ID' },
+  incident_id: { zh: '告警 ID', en: 'Incident ID' },
+  severity: { zh: '严重度', en: 'Severity' },
+  rule: { zh: '规则', en: 'Rule' },
+  labels: { zh: '标签', en: 'Labels' },
+  answer: { zh: '回答', en: 'Answer' },
+  result: { zh: '结果', en: 'Result' },
+  results: { zh: '结果', en: 'Results' },
+  error: { zh: '错误', en: 'Error' },
+  error_count: { zh: '失败数', en: 'Error count' },
+  success_count: { zh: '成功数', en: 'Success count' },
+  host_load: { zh: '主机负载', en: 'Host load' },
+  structured: { zh: '结构化输出', en: 'Structured' },
+  name: { zh: '名称', en: 'Name' },
+  value: { zh: '值', en: 'Value' },
+  channels: { zh: '渠道数', en: 'Channels' },
+  sent: { zh: '已发送', en: 'Sent' },
+  cron: { zh: '定时表达式', en: 'Cron' },
+};
+
+function prettifyLeaf(seg: string): string {
+  return seg
+    .replace(/\[\d+\]/g, '')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+    .trim();
+}
+
+// friendlyFieldLabel turns a dotted path into a readable field name. Uses the
+// LEAF segment (last non-array key) so "result.results[0].host_load.cpu_pct"
+// reads as "CPU 使用率". A row index >0 is appended as "#n" to disambiguate.
+function friendlyFieldLabel(path: string, locale: string): string {
+  const segs = path.split('.');
+  const leafRaw = segs[segs.length - 1] || path;
+  const leaf = leafRaw.replace(/\[\d+\]/g, '');
+  const known = FIELD_LABELS[leaf];
+  let label = known ? (locale === 'zh-CN' ? known.zh : known.en) : prettifyLeaf(leaf);
+  const idxMatch = path.match(/\[(\d+)\]/g);
+  if (idxMatch) {
+    const last = idxMatch[idxMatch.length - 1].match(/\d+/);
+    if (last && Number(last[0]) > 0) label += ` #${Number(last[0]) + 1}`;
+  }
+  return label;
+}
+
+// friendlyRef decodes a whole {{...}} reference into "节点名 › 字段名", or null
+// if it isn't a recognised reference. nodeLabels maps node id → canvas label.
+function friendlyRef(ref: string, nodeLabels: Map<string, string>, locale: string): string | null {
+  const m = ref.match(/^\{\{\s*([^{}]+?)\s*\}\}$/);
+  if (!m) return null;
+  const expr = m[1];
+  let mm = expr.match(/^nodes\.([^.]+)\.output\.(.+)$/);
+  if (mm) return `${nodeLabels.get(mm[1]) ?? mm[1]} › ${friendlyFieldLabel(mm[2], locale)}`;
+  mm = expr.match(/^trigger\.(.+)$/);
+  if (mm) return `${locale === 'zh-CN' ? '触发器' : 'Trigger'} › ${friendlyFieldLabel(mm[1], locale)}`;
+  mm = expr.match(/^vars\.(.+)$/);
+  if (mm) return `${locale === 'zh-CN' ? '变量' : 'Var'} › ${mm[1]}`;
+  return null;
+}
+
+// collectRefs pulls every {{...}} template out of a config object's string
+// leaves (deep), so the panel can show what a node references at a glance.
+function collectRefs(v: unknown, out: string[] = []): string[] {
+  if (typeof v === 'string') {
+    const matches = v.match(/\{\{\s*[^{}]+?\s*\}\}/g);
+    if (matches) for (const r of matches) if (!out.includes(r)) out.push(r);
+  } else if (Array.isArray(v)) {
+    for (const e of v) collectRefs(e, out);
+  } else if (v && typeof v === 'object') {
+    for (const e of Object.values(v as Record<string, unknown>)) collectRefs(e, out);
+  }
+  return out;
+}
+
 // staticOutputHints is the fallback when a node hasn't run yet — the known
 // output shape per node type, so the user still sees what to reference. The
 // backend NodeSpec.output_shape (specShape) is the source of truth for
@@ -1436,7 +1528,7 @@ function UpstreamRefs({
   onCopy: (ref: string) => void;
   copied: string;
 }) {
-  const { tr } = useI18n();
+  const { tr, locale } = useI18n();
   const ups = useMemo(() => {
     const set = upstreamOf(selectedId, edges);
     const runByID = new Map(runNodes.map((r) => [r.node_id, r]));
@@ -1489,26 +1581,58 @@ function UpstreamRefs({
             <div className="mt-0.5 flex flex-wrap gap-1">
               {u.entries.map((e) => {
                 const ref = `{{nodes.${u.id}.output.${e.path}}}`;
+                const label = friendlyFieldLabel(e.path, locale);
                 const preview = u.live ? previewValue(e.value) : '';
                 return (
                   <button
                     key={e.path}
                     type="button"
-                    title={preview ? `${ref}\n= ${preview}` : ref}
+                    title={`${label}\n${e.path}\n${ref}${preview ? `\n= ${preview}` : ''}`}
                     onClick={() => onCopy(ref)}
-                    className={`max-w-full truncate rounded border px-1 py-0.5 font-mono text-[9px] transition-colors ${
+                    className={`max-w-full truncate rounded border px-1 py-0.5 text-[10px] transition-colors ${
                       copied === ref
                         ? 'border-emerald-700 bg-emerald-950/40 text-emerald-400'
-                        : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                        : 'border-zinc-800 bg-zinc-950 text-zinc-300 hover:border-zinc-700 hover:text-zinc-100'
                     }`}
                   >
-                    {e.path}
-                    {preview ? <span className="ml-1 text-zinc-600">= {preview}</span> : null}
+                    {label}
+                    {preview ? <span className="ml-1 font-mono text-[9px] text-zinc-500">= {preview}</span> : null}
                   </button>
                 );
               })}
             </div>
           </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ReferencedData decodes the {{...}} templates inside the selected node's
+// config into friendly "节点名 › 字段名" chips — so the cryptic refs the user
+// pasted into config inputs are readable at a glance (step-1 friendly read-
+// back; the input box itself still holds the canonical template).
+function ReferencedData({ config, nodes }: { config: Record<string, unknown>; nodes: CanvasNode[] }) {
+  const { tr, locale } = useI18n();
+  const items = useMemo(() => {
+    const labels = new Map(nodes.map((n) => [n.id, n.data.label]));
+    return collectRefs(config)
+      .map((ref) => ({ ref, friendly: friendlyRef(ref, labels, locale) }))
+      .filter((x): x is { ref: string; friendly: string } => !!x.friendly);
+  }, [config, nodes, locale]);
+  if (items.length === 0) return null;
+  return (
+    <div className="mt-2 rounded-md border border-indigo-900/40 bg-indigo-950/15 p-2">
+      <div className="mb-1 text-[11px] font-medium text-indigo-300/90">{tr('本节点引用了', 'This node references')}</div>
+      <div className="flex flex-wrap gap-1">
+        {items.map((it) => (
+          <span
+            key={it.ref}
+            title={it.ref}
+            className="rounded border border-indigo-900/50 bg-indigo-950/30 px-1.5 py-0.5 text-[10px] text-indigo-200"
+          >
+            {it.friendly}
+          </span>
         ))}
       </div>
     </div>
@@ -1534,7 +1658,7 @@ function SelfOutputRefs({
   onCopy: (ref: string) => void;
   copied: string;
 }) {
-  const { tr } = useI18n();
+  const { tr, locale } = useI18n();
   const { entries, source } = useMemo(() => {
     // Priority: a fresh node-level test run → the latest flow run → the
     // node type's known shape.
@@ -1569,26 +1693,27 @@ function SelfOutputRefs({
         )}
       </div>
       <div className="mb-1.5 text-[10px] leading-relaxed text-zinc-600">
-        {tr('本节点输出的字段，供下游节点引用。点字段复制 {{…}}。', "This node's output fields, for downstream refs. Click to copy {{…}}.")}
+        {tr('本节点输出的字段（友好名），供下游引用。点字段复制 {{…}}。', "This node's output fields (friendly names), for downstream refs. Click to copy {{…}}.")}
       </div>
       <div className="flex flex-wrap gap-1">
         {entries.map((e) => {
           const ref = `{{nodes.${node.id}.output.${e.path}}}`;
+          const label = friendlyFieldLabel(e.path, locale);
           const preview = hasValues ? previewValue(e.value) : '';
           return (
             <button
               key={e.path}
               type="button"
-              title={preview ? `${ref}\n= ${preview}` : ref}
+              title={`${label}\n${e.path}\n${ref}${preview ? `\n= ${preview}` : ''}`}
               onClick={() => onCopy(ref)}
-              className={`max-w-full truncate rounded border px-1 py-0.5 font-mono text-[9px] transition-colors ${
+              className={`max-w-full truncate rounded border px-1 py-0.5 text-[10px] transition-colors ${
                 copied === ref
                   ? 'border-emerald-700 bg-emerald-950/40 text-emerald-400'
-                  : 'border-zinc-800 bg-zinc-950 text-zinc-400 hover:border-zinc-700 hover:text-zinc-200'
+                  : 'border-zinc-800 bg-zinc-950 text-zinc-300 hover:border-zinc-700 hover:text-zinc-100'
               }`}
             >
-              {e.path}
-              {preview ? <span className="ml-1 text-zinc-600">= {preview}</span> : null}
+              {label}
+              {preview ? <span className="ml-1 font-mono text-[9px] text-zinc-500">= {preview}</span> : null}
             </button>
           );
         })}
