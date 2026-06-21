@@ -108,9 +108,18 @@ type Registry struct {
 	// before chat runtime but after the registry's constructor deps.
 	pluginConfigs PluginConfigLister
 
+	// cloudBashProposer wires the cloud_bash tool to the human approval
+	// inbox. Set post-construction (cmd/main.go) via SetCloudBashProposer;
+	// nil → cloud_bash is NOT registered.
+	cloudBashProposer CloudBashProposer
+
 	log   *slog.Logger
 	tools map[string]Tool
 }
+
+// SetCloudBashProposer wires the cloud_bash → approval-inbox seam. Call
+// after NewRegistry (cmd/main.go).
+func (r *Registry) SetCloudBashProposer(p CloudBashProposer) { r.cloudBashProposer = p }
 
 // SetAuditLister wires the audit query seam consumed by
 // query_change_events. Call after NewRegistry (cmd/main.go).

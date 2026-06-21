@@ -42,6 +42,7 @@ import (
 	"github.com/ongridio/ongrid/internal/pkg/httpserver"
 	"github.com/ongridio/ongrid/internal/pkg/llm"
 	"github.com/ongridio/ongrid/internal/pkg/logger"
+	"github.com/ongridio/ongrid/internal/pkg/runner"
 	"github.com/ongridio/ongrid/internal/pkg/secretbox"
 
 	"encoding/json"
@@ -1774,6 +1775,37 @@ func main() {
 	// proposes; producers register their execute-on-approve executor.
 	approvalUC := managerbizapproval.NewUsecase(managerapprovaldata.NewRepo(db), log.With(slog.String("comp", "approval")))
 	approvalHandler := managerserverapproval.NewHandler(approvalUC)
+	// HLD-017 cloud_bash producer: register the execute-on-approve executor
+	// (resolve the bound credential → inject into the Runner sandbox → run)
+	// and wire the cloud_bash tool's proposer seam to the approval inbox.
+	cloudBashRunner := runner.NewShellRunner()
+	approvalUC.RegisterExecutor("cloud_bash", func(ctx context.Context, payloadJSON string) (string, error) {
+		var p struct {
+			Command    string `json:"command"`
+			Credential string `json:"credential"`
+		}
+		if err := json.Unmarshal([]byte(payloadJSON), &p); err != nil {
+			return "", err
+		}
+		env := map[string]string{}
+		if p.Credential != "" {
+			injected, _, err := secretUC.ResolveInjection(ctx, p.Credential)
+			if err != nil {
+				return "", fmt.Errorf("resolve credential %q: %w", p.Credential, err)
+			}
+			env = injected
+		}
+		res, err := cloudBashRunner.Run(ctx, runner.Spec{Script: p.Command, Env: env})
+		if err != nil {
+			return "", err
+		}
+		out, _ := json.Marshal(map[string]any{
+			"stdout": res.Stdout, "stderr": res.Stderr,
+			"exit_code": res.ExitCode, "truncated": res.Truncated,
+		})
+		return string(out), nil
+	})
+	toolsReg.SetCloudBashProposer(cloudBashProposerShim{uc: approvalUC})
 	if secretbox.KeyIsWeak() {
 		log.Warn("secret vault: ONGRID_SECRET_KEY unset — credentials encrypted with an INSECURE built-in key; set ONGRID_SECRET_KEY (32+ random chars) for real at-rest protection")
 	}
@@ -3114,6 +3146,35 @@ func (a webshellAuditAdapter) List(ctx context.Context, limit int) ([]*wsmodel.S
 // path. That is a pre-existing gap, not specific to flows; when the
 // ReviewSpawner is wired, decide separately whether unattended flow runs
 // (cron/alert) should block on a human reviewer at all.
+// cloudBashProposerShim adapts biz/approval.Usecase to the
+// aiopstools.CloudBashProposer seam — the cloud_bash tool calls Propose to
+// queue a command for human approval (HLD-017).
+type cloudBashProposerShim struct{ uc *managerbizapproval.Usecase }
+
+func (s cloudBashProposerShim) Propose(ctx context.Context, command, credential, sessionID string, userID uint64) (string, error) {
+	title := command
+	if len(title) > 100 {
+		title = title[:100] + "…"
+	}
+	summary := ""
+	if credential != "" {
+		summary = "凭证 / credential: " + credential
+	}
+	a, err := s.uc.Propose(ctx, managerbizapproval.ProposeInput{
+		Kind:       "cloud_bash",
+		Title:      title,
+		Summary:    summary,
+		Payload:    map[string]string{"command": command, "credential": credential},
+		Source:     "agent",
+		SessionID:  sessionID,
+		ProposedBy: userID,
+	})
+	if err != nil {
+		return "", err
+	}
+	return a.ID, nil
+}
+
 type flowToolInvoker struct {
 	tools map[string]aiopstoolsbase.BaseTool
 }

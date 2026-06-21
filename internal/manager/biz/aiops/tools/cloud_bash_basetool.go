@@ -1,0 +1,115 @@
+package tools
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/ongridio/ongrid/internal/manager/biz/aiops/tools/basetool"
+)
+
+// cloud_bash — the cloud-side (manager) command tool, sibling of host_bash
+// (which runs on an edge device via tunnel). cloud_bash runs a command in
+// the manager-side Runner sandbox with a bound credential's env injected —
+// the path for terraform / cloud-CLI / kubectl that operate on cloud
+// resources (HLD-017).
+//
+// SAFETY (MVP): cloud_bash does NOT execute directly. Every call queues a
+// proposal into the human approval inbox (biz/approval); an admin approves
+// in the "待确认" page, and only then does the registered executor run the
+// command in the Runner. So the LLM can never run an arbitrary manager-side
+// command with cloud credentials without a human in the loop. A read-class
+// auto-run allowlist is a future refinement.
+
+// ToolNameCloudBash is the wire name.
+const ToolNameCloudBash = "cloud_bash"
+
+// CloudBashProposer is the narrow seam to the approval inbox. Implemented in
+// cmd/main.go over biz/approval.Usecase so this package doesn't import it.
+type CloudBashProposer interface {
+	// Propose queues the command for human approval and returns the
+	// approval id. credential is the optional vault credential name whose
+	// fields get injected as env at execute time.
+	Propose(ctx context.Context, command, credential, sessionID string, userID uint64) (id string, err error)
+}
+
+// CloudBashTool is the cloud_bash BaseTool.
+type CloudBashTool struct {
+	proposer CloudBashProposer
+	log      *slog.Logger
+}
+
+// NewCloudBashTool builds the tool.
+func NewCloudBashTool(p CloudBashProposer, log *slog.Logger) *CloudBashTool {
+	if log == nil {
+		log = slog.Default()
+	}
+	return &CloudBashTool{proposer: p, log: log}
+}
+
+// CloudBashSchema is the args JSON Schema.
+var CloudBashSchema = json.RawMessage(`{
+  "type": "object",
+  "properties": {
+    "command": {
+      "type": "string",
+      "description": "The shell command to run in the cloud (manager) sandbox, e.g. 'terraform plan'. Runs with the chosen credential's env injected."
+    },
+    "credential": {
+      "type": "string",
+      "description": "Optional name of a stored credential (设置→凭证) whose fields are injected as env vars (e.g. 'tencent-prod' → TENCENTCLOUD_SECRET_ID/KEY). Omit for commands that need no cloud auth."
+    }
+  },
+  "required": ["command"]
+}`)
+
+const cloudBashWhenToUse = "在云端(manager)运行命令——terraform / 云厂商 CLI / kubectl 等操作云资源的命令。" +
+	"不同于 host_bash(在某台设备上跑)。注意:每次调用都会进入人工审批,管理员在'待确认'页批准后才真正执行;" +
+	"所以可以放心发起,但要告诉用户去批准。需要云凭证时传 credential(凭证库里的名字)。"
+
+// Info — Class=destructive: cloud_bash can run anything with cloud creds, so
+// it always carries the highest gate (and routes through human approval).
+func (t *CloudBashTool) Info(_ context.Context) (*basetool.ToolInfo, error) {
+	return &basetool.ToolInfo{
+		Name:        ToolNameCloudBash,
+		Description: "Run a command in the cloud (manager) sandbox with an injected credential; queued for human approval before it executes.",
+		WhenToUse:   cloudBashWhenToUse,
+		Parameters:  CloudBashSchema,
+		Class:       "destructive",
+	}, nil
+}
+
+type cloudBashArgs struct {
+	Command    string `json:"command"`
+	Credential string `json:"credential"`
+}
+
+// InvokableRun queues an approval and returns a human-readable status. It
+// never executes the command itself (the approval executor does, post-
+// approval).
+func (t *CloudBashTool) InvokableRun(ctx context.Context, argsJSON string, opts ...basetool.InvokeOption) (string, error) {
+	if t.proposer == nil {
+		return "", fmt.Errorf("cloud_bash: approval inbox not wired")
+	}
+	var in cloudBashArgs
+	if err := json.Unmarshal([]byte(argsJSON), &in); err != nil {
+		return "", fmt.Errorf("cloud_bash: bad args: %w", err)
+	}
+	if strings.TrimSpace(in.Command) == "" {
+		return "", fmt.Errorf("cloud_bash: command is required")
+	}
+	cfg := basetool.ResolveOptions(opts)
+	id, err := t.proposer.Propose(ctx, in.Command, strings.TrimSpace(in.Credential), "", cfg.UserID)
+	if err != nil {
+		return "", fmt.Errorf("cloud_bash: propose: %w", err)
+	}
+	out := map[string]any{
+		"status":      "pending_approval",
+		"approval_id": id,
+		"message":     "命令已提交人工审批，请管理员在「待确认」页批准后才会执行。Command queued for human approval (see the Approvals page); it will run only after an admin approves.",
+	}
+	b, _ := json.Marshal(out)
+	return string(b), nil
+}
