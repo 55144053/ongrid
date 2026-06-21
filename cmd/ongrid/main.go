@@ -102,6 +102,7 @@ import (
 	managerbizknowledge "github.com/ongridio/ongrid/internal/manager/biz/knowledge"
 	managerbizmarketplace "github.com/ongridio/ongrid/internal/manager/biz/marketplace"
 	managerbizmonitor "github.com/ongridio/ongrid/internal/manager/biz/monitor"
+	managerbizsecret "github.com/ongridio/ongrid/internal/manager/biz/secret"
 	managerbizsetting "github.com/ongridio/ongrid/internal/manager/biz/setting"
 	managerbizskill "github.com/ongridio/ongrid/internal/manager/biz/skill"
 	managerwebshellbiz "github.com/ongridio/ongrid/internal/manager/biz/webshell"
@@ -110,6 +111,7 @@ import (
 	managerknowledgedata "github.com/ongridio/ongrid/internal/manager/data/knowledge/store"
 	managermarketplacedata "github.com/ongridio/ongrid/internal/manager/data/marketplace/store"
 	managermonitordata "github.com/ongridio/ongrid/internal/manager/data/monitor/store"
+	managersecretdata "github.com/ongridio/ongrid/internal/manager/data/secret/store"
 	managersettingdata "github.com/ongridio/ongrid/internal/manager/data/setting/store"
 	managerwebshelldata "github.com/ongridio/ongrid/internal/manager/data/webshell/store"
 	settingmodel "github.com/ongridio/ongrid/internal/manager/model/setting"
@@ -139,6 +141,7 @@ import (
 	managerservermonitor "github.com/ongridio/ongrid/internal/manager/server/monitor"
 	managerserverprom "github.com/ongridio/ongrid/internal/manager/server/prometheus"
 	managerserverreport "github.com/ongridio/ongrid/internal/manager/server/report"
+	managerserversecret "github.com/ongridio/ongrid/internal/manager/server/secret"
 	managerserversetting "github.com/ongridio/ongrid/internal/manager/server/setting"
 	managerserverskill "github.com/ongridio/ongrid/internal/manager/server/skill"
 	managerserversystemhealth "github.com/ongridio/ongrid/internal/manager/server/systemhealth"
@@ -232,6 +235,7 @@ func main() {
 		managerbizskill.Migrate,
 		managersettingdata.Migrate,
 		managermarketplacedata.Migrate,
+		managersecretdata.Migrate,
 		managermonitordata.Migrate,
 		managerwebshelldata.Migrate,
 		manageraudtdata.Migrate,
@@ -1726,6 +1730,10 @@ func main() {
 		DevMode:              mpDevMode,
 	}, log.With(slog.String("comp", "marketplace")))
 	marketplaceHandler := managerservermarketplace.NewHandler(mpUC)
+	// HLD-017 generic secret vault: the single semantics-agnostic credential
+	// store installed skills (and future external-MCP clients) inject from.
+	secretUC := managerbizsecret.NewUsecase(managersecretdata.NewRepo(db))
+	secretHandler := managerserversecret.NewHandler(secretUC)
 	log.Info("marketplace wired",
 		slog.Bool("dev_mode", mpDevMode),
 		slog.Bool("skill_reload", mpSkillReg != nil),
@@ -1872,6 +1880,7 @@ func main() {
 			settingHandler.Register(protected)
 			integrationHandler.Register(protected)
 			marketplaceHandler.Register(protected)
+			secretHandler.Register(protected)
 			promProxyHandler.RegisterProtected(protected)
 			managerserveraudit.NewHandler(auditUC).Register(protected)
 			reportHandler.Register(protected)

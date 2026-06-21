@@ -39,6 +39,7 @@ const SettingsChannels = lazy(() => import('@/pages/settings/Channels'));
 const SettingsIntegrations = lazy(() => import('@/pages/settings/Integrations'));
 const SettingsMarketplace = lazy(() => import('@/pages/settings/Marketplace'));
 const SettingsPreferences = lazy(() => import('@/pages/settings/Preferences'));
+const SettingsSecrets = lazy(() => import('@/pages/settings/Secrets'));
 const SettingsHealth = lazy(() => import('@/pages/settings/Health'));
 // Admin section (top-level "管理" tab) — platform governance pages.
 // Lifted out of /settings so adding RBAC editor / audit log doesn't
@@ -143,6 +144,7 @@ export default function App() {
         <Route path="/settings" element={<SettingsLayout />}>
           <Route index element={<Navigate to="health" replace />} />
           <Route path="llm" element={<SettingsLLM />} />
+          <Route path="secrets" element={<SettingsSecrets />} />
           <Route path="notifications" element={<SettingsNotifications />} />
           <Route path="channels" element={<SettingsChannels />} />
           <Route path="integrations" element={<SettingsIntegrations />} />

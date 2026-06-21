@@ -7,6 +7,7 @@ import {
   MessagesSquare,
   Gauge,
   HeartPulse,
+  Lock,
   Plug,
   Shield,
 } from 'lucide-react';
@@ -35,6 +36,7 @@ const RAIL_ITEMS: RailItem[] = [
   // /skills?tab=install so the whole skill story (loaded + installed)
   // lives on one page. The Settings route still redirects bookmarks.
   { to: 'llm', icon: KeyRound, labelZh: '模型', labelEn: 'LLM', hintZh: 'OpenAI / 兼容服务', hintEn: 'OpenAI / compatible providers' },
+  { to: 'secrets', icon: Lock, labelZh: '密钥', labelEn: 'Secrets', hintZh: '技能 / MCP 注入的凭据（env / 文件）', hintEn: 'Credentials injected into skills / MCP (env / files)' },
   // 通知 = 单向告警推送(channel in the alert sense). channels = 双向 chat
   // bot(IM in the messaging sense). We pair URL ↔ label so the route name
   // matches what the user sees in the sidebar; back-compat redirects from
