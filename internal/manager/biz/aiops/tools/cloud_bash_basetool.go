@@ -115,7 +115,7 @@ func (t *CloudBashTool) InvokableRun(ctx context.Context, argsJSON string, opts 
 		// so the model must NOT invent a page/menu to visit or restate the
 		// command/id/status — the card already shows all of that. Keep the
 		// reply to one short sentence, in the conversation's language.
-		"message": "An interactive confirmation card (with the command and Approve/Reject buttons) is now shown inline in this conversation. Do NOT tell the user to open any page or menu, and do NOT restate the command, approval id, or a status table. Reply with a single short sentence saying the command needs the user's confirmation before it runs.",
+		"message": "An interactive confirmation card is now shown inline in this conversation. Do NOT tell the user to open any page or menu, do NOT restate the command, approval id, or a status table, and do NOT name a specific button label (its text follows the user's UI language). Reply with a single short sentence saying the command needs the user's confirmation in this conversation before it runs.",
 	}
 	b, _ := json.Marshal(out)
 	return string(b), nil
