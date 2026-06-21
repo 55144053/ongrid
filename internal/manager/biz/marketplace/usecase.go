@@ -393,6 +393,31 @@ func (uc *Usecase) Uninstall(ctx context.Context, caller Caller, packID string) 
 	return nil
 }
 
+// SetBindings persists the operator's slot→credential choices for an
+// installed pack (HLD-017 credential binding). bindings maps a credential
+// slot declared by the pack's skills (requires.credentials[].slot) to a
+// stored vault credential NAME. Admin-only; replaces the whole map.
+func (uc *Usecase) SetBindings(ctx context.Context, caller Caller, packID string, bindings map[string]string) error {
+	if !caller.IsAdmin() {
+		return fmt.Errorf("%w: setting credential bindings requires admin role", errs.ErrForbidden)
+	}
+	if packID == "" {
+		return fmt.Errorf("%w: pack_id required", errs.ErrInvalid)
+	}
+	clean := map[string]string{}
+	for slot, cred := range bindings {
+		slot, cred = strings.TrimSpace(slot), strings.TrimSpace(cred)
+		if slot != "" && cred != "" {
+			clean[slot] = cred
+		}
+	}
+	b, err := json.Marshal(clean)
+	if err != nil {
+		return err
+	}
+	return uc.repo.SetBindings(ctx, caller.TenantID, packID, string(b))
+}
+
 // AllowedRegistries is what the GET /v1/marketplace/registries
 // endpoint returns. Static today; resolves to AllowedSources +
 // "local" tag. The DevMode flag toggles every entry.

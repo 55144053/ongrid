@@ -14,6 +14,7 @@ type Repo interface {
 	GetByManifestSHA(ctx context.Context, tenantID uint64, sha string) (*model.InstalledPack, error)
 	List(ctx context.Context, tenantID uint64) ([]*model.InstalledPack, error)
 	DeleteSoft(ctx context.Context, tenantID uint64, packID string) error
+	SetBindings(ctx context.Context, tenantID uint64, packID, bindingsJSON string) error
 }
 
 // SkillRegistry is the narrow surface the usecase uses to hot-reload
