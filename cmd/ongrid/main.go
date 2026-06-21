@@ -1679,6 +1679,36 @@ func main() {
 		managerbizskill.NewGormAuditSink(db),
 		log.With(slog.String("comp", "skill")),
 	)
+	// HLD-017: surface chatruntime SKILL.md skills (built-in + marketplace-
+	// installed) in the /v1/skills catalog. They live in a separate registry
+	// from skillcore, so without this an installed pack (e.g. terrashark) is
+	// invisible in the catalog even though the agent already uses it.
+	skillSvc.WithExtraSkills(func() []managerbizskill.SkillSummary {
+		if bootstrapSkillReg == nil {
+			return nil
+		}
+		var out []managerbizskill.SkillSummary
+		for _, sk := range bootstrapSkillReg.All() {
+			if sk == nil || sk.Name == "" {
+				continue
+			}
+			scope := skillcore.ScopeManager
+			if sk.Metadata.Ongrid.Scope == string(skillcore.ScopeHost) {
+				scope = skillcore.ScopeHost
+			}
+			out = append(out, managerbizskill.SkillSummary{
+				Key:           sk.Name,
+				Name:          sk.Name,
+				Description:   sk.Description,
+				Class:         skillcore.ClassSafe,
+				Scope:         scope,
+				Category:      "skill",
+				Source:        firstNonEmpty(sk.Provenance.Source, "builtin"),
+				InventoryOnly: true,
+			})
+		}
+		return out
+	})
 	skillHandler := managerserverskill.NewHandler(skillSvc)
 
 	// marketplace wiring. Install / List / Uninstall on

@@ -285,7 +285,17 @@ function SkillRow({ skill }: { skill: SkillSummary }) {
   return (
     <tr className="transition-colors hover:bg-zinc-900/40">
       <td className="whitespace-nowrap px-4 py-2.5">
-        <div className="font-medium text-zinc-100">{skill.name}</div>
+        <div className="flex items-center gap-1.5">
+          <span className="font-medium text-zinc-100">{skill.name}</span>
+          {skill.source && skill.source !== 'builtin' && (
+            <span
+              className="rounded bg-violet-900/40 px-1 text-[9px] font-medium text-violet-300"
+              title={tr(`来自市场安装（${skill.source}）`, `installed from marketplace (${skill.source})`)}
+            >
+              {tr('已安装', 'installed')}
+            </span>
+          )}
+        </div>
         <div className="mt-0.5 font-mono text-[11px] text-zinc-500" title={skill.key}>
           {skill.key}
         </div>
