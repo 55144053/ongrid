@@ -154,7 +154,7 @@ func extractZip(archivePath, dest string) error {
 		if err != nil {
 			return err
 		}
-		err = writeFile(target, rc)
+		err = writeFile(target, rc, f.FileInfo().Mode())
 		rc.Close()
 		if err != nil {
 			return err
@@ -186,7 +186,7 @@ func extractTar(r io.Reader, dest string) error {
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 				return err
 			}
-			if err := writeFile(target, tr); err != nil {
+			if err := writeFile(target, tr, os.FileMode(hdr.Mode)); err != nil {
 				return err
 			}
 			// symlinks / devices / etc. are skipped (a skill pack is plain files)
@@ -194,12 +194,25 @@ func extractTar(r io.Reader, dest string) error {
 	}
 }
 
-func writeFile(target string, r io.Reader) error {
-	out, err := os.Create(target)
+func writeFile(target string, r io.Reader, mode os.FileMode) error {
+	// Preserve the executable bit from the archive entry so a skill that ships
+	// a binary (e.g. terraform) stays runnable after extraction: any entry
+	// that was executable lands 0755, everything else 0644. We deliberately do
+	// NOT honor setuid/setgid/sticky from an uploaded archive.
+	perm := os.FileMode(0o644)
+	if mode&0o111 != 0 {
+		perm = 0o755
+	}
+	out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
+	// Chmod explicitly — OpenFile honors umask and won't re-mode an existing
+	// file, so the executable bit could otherwise be masked away.
+	if err := out.Chmod(perm); err != nil {
+		return err
+	}
 	_, err = io.Copy(out, io.LimitReader(r, maxExtractedFile))
 	return err
 }
