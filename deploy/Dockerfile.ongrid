@@ -64,20 +64,15 @@ FROM debian:bookworm-slim
 #   - python3 / python3-pip: the cloud_bash sandbox runs as non-root with
 #     no package manager, so an agent can't install tooling at runtime; a
 #     huge swath of cloud CLIs (tccli, awscli, …) are Python. Ship a usable
-#     Python so cloud_bash commands can call them.
+#     Python interpreter so cloud_bash can install + run them. The TOOLS
+#     themselves are NOT baked here — they install into a host-mounted
+#     persistent volume (/var/lib/ongrid/tools, the cloud_bash PYTHONUSERBASE)
+#     so they survive container recreation, don't bloat the image, and can be
+#     added at runtime via the approval-gated cloud_bash (no image rebuild).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         git openssh-client ca-certificates tzdata libgomp1 libstdc++6 curl \
         python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
-
-# Pre-install the Tencent Cloud CLI system-wide so cloud_bash can run `tccli`
-# directly. Done at build time (as root, --break-system-packages for PEP 668)
-# so it lands on the system PATH and survives container recreation — the
-# sandbox is non-root, so a runtime `pip install` would otherwise fail. This
-# is a test-env/demo convenience; the cleaner open-core path is shipping each
-# vendor CLI as a marketplace skill that drops a binary into <pack>/bin.
-RUN pip3 install --no-cache-dir --break-system-packages tccli \
-    && tccli --version >/dev/null 2>&1 || true
 
 # ONNX Runtime shared library. Pin the version so a future apt-mirror
 # bump doesn't silently change ABI. v1.20.1 is the latest stable that

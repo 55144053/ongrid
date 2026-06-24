@@ -1837,13 +1837,19 @@ func main() {
 				env[k] = v
 			}
 		}
-		// Make installed extension binaries reachable. Skills install verbatim
-		// under marketplaceSkillsRoot/<pack>/; a skill that ships a CLI puts it
-		// in <pack>/bin/. The sandbox PATH otherwise never sees those dirs, so
-		// the agent can't run an installed tool (e.g. tccli) and wastes a turn
-		// re-installing it from scratch (which fails — the sandbox is non-root
-		// with no package manager). Prepend every existing bin dir.
-		env["PATH"] = skillBinPATH(marketplaceSkillsRoot)
+		// Tools live on a host-mounted persistent volume, NOT in the image:
+		// they survive container recreation, don't bloat the image, and the
+		// agent can install more at runtime (each install command is itself
+		// gated by the human approval card). cloudBashToolsDir is the
+		// PYTHONUSERBASE, so `pip install` (PIP_USER) drops packages +
+		// entrypoint scripts under it; its bin dir + every installed skill's
+		// bin dir go on PATH. PIP_BREAK_SYSTEM_PACKAGES sidesteps PEP 668 so a
+		// non-root --user install isn't refused.
+		env["PATH"] = cloudBashToolsDir + "/bin:" + skillBinPATH(marketplaceSkillsRoot)
+		env["PYTHONUSERBASE"] = cloudBashToolsDir
+		env["PIP_USER"] = "1"
+		env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
+		env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
 		// Resolve the session's persistent workspace as cwd (HLD-019). Empty
 		// workdir → runner uses a transient temp dir (legacy behavior).
 		workdir, err := wsMgr.Session(p.SessionID)
@@ -3388,6 +3394,14 @@ const approvalPollInterval = 1500 * time.Millisecond
 // cloudBashSystemPATH is the fallback PATH for the cloud_bash sandbox when no
 // installed skill ships a bin dir. Mirrors runner.buildEnv's default.
 const cloudBashSystemPATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+// cloudBashToolsDir is the host-mounted persistent volume where cloud_bash
+// tools live (the PYTHONUSERBASE for pip --user installs, and a general
+// <dir>/bin on PATH for any binary the agent drops there). Bind-mounted from
+// the host in docker-compose, so tools survive container recreation and never
+// touch the image. An installed tool's command still routes through the human
+// approval card, which is the security boundary (HLD-017/021).
+const cloudBashToolsDir = "/var/lib/ongrid/tools"
 
 // skillBinPATH returns a PATH that prepends every installed skill's bin dir
 // (skillsRoot/<pack>/bin) to the system default, so a CLI an extension ships

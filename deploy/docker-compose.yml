@@ -163,6 +163,10 @@ services:
       - ../.cache/ongrid-skills:/var/lib/ongrid/skills
       # HLD-019 agent workspace: per-session persistent cwd for cloud_bash.
       - ../.cache/ongrid-workspace:/var/lib/ongrid/workspace
+      # cloud_bash tools: host-mounted PYTHONUSERBASE + <dir>/bin on PATH, so
+      # CLIs the agent installs (tccli, awscli, …) persist on the host across
+      # container recreation instead of being baked into the image.
+      - ../.cache/ongrid-tools:/var/lib/ongrid/tools
     # ADR-008: HTTP API (8080) is no longer published to host in the
     # production-shape stack — nginx fronts it on 443/80. Metrics port
     # 9100 stays exposed for the host's Prometheus.
