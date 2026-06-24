@@ -3,6 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { Cloud, Cpu, Wrench, RefreshCw, Play, Search, Puzzle } from 'lucide-react';
 import { cn } from '@/lib/cn';
 import { listSkills, localizedSkill, type SkillClass, type SkillScope, type SkillSummary } from '@/api/skills';
+import { listFlowTools, type FlowToolMeta } from '@/api/flows';
 import { createSession, listModels, type LLMProvider } from '@/api/chat';
 import { ApiError } from '@/api/client';
 import { Modal } from '@/components/Modal';
@@ -160,6 +161,23 @@ function TabButton({ active, onClick, icon, label }: { active: boolean; onClick:
   );
 }
 
+// mcpToSkill maps an MCP flow tool into a Skills-page inventory item. MCP
+// carries no read/write signal, so class is shown gently (read→safe, else
+// →mutating, not alarmist red). source="mcp" drives the tag.
+function mcpToSkill(t: FlowToolMeta): SkillSummary {
+  return {
+    key: t.name,
+    name: t.display_zh || t.name,
+    description: t.description_zh || t.description || '',
+    class: t.class === 'read' ? 'safe' : 'mutating',
+    scope: 'manager',
+    category: t.category,
+    params: [],
+    source: 'mcp',
+    inventory_only: true,
+  };
+}
+
 function CatalogTab() {
   const { tr, locale } = useI18n();
   const [items, setItems] = useState<SkillSummary[]>([]);
@@ -177,8 +195,16 @@ function CatalogTab() {
     if (silent) setRefreshing(true);
     else setLoading(true);
     try {
-      const r = await listSkills();
-      setItems((r.items ?? []).map(localizedSkill));
+      // The Skills page is the LLM's full visible-capability inventory, so it
+      // also pulls MCP tools (which live outside the skill registry) and shows
+      // them as inventory items tagged "mcp", grouped under their server.
+      const [sk, ft] = await Promise.all([
+        listSkills(),
+        listFlowTools().catch(() => ({ items: [] as FlowToolMeta[] })),
+      ]);
+      const base = (sk.items ?? []).map(localizedSkill);
+      const mcp = (ft.items ?? []).filter((t) => t.name.startsWith('mcp__')).map(mcpToSkill);
+      setItems([...base, ...mcp]);
       setErr(null);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : (e as Error).message);
@@ -321,10 +347,14 @@ function CatalogTab() {
                 </thead>
                 {orderedSkillKeys(filtered.map((s) => toolSkill(s.name))).map((sk) => (
                   <tbody key={sk} className="divide-y divide-zinc-800/40">
-                    <tr className="bg-zinc-950/40">
-                      <td colSpan={5} className="px-4 py-1.5 text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-                        {skillLabel(sk, locale === 'zh-CN')}
-                        <span className="ml-1.5 text-zinc-600">{filtered.filter((s) => toolSkill(s.name) === sk).length}</span>
+                    <tr className="border-t border-zinc-800/60 bg-zinc-950/50">
+                      <td colSpan={5} className="px-4 py-2">
+                        <span className="text-[13px] font-semibold text-zinc-200">
+                          {skillLabel(sk, locale === 'zh-CN')}
+                        </span>
+                        <span className="ml-2 text-[11px] text-zinc-500">
+                          {filtered.filter((s) => toolSkill(s.name) === sk).length} {tr('个工具', 'tools')}
+                        </span>
                       </td>
                     </tr>
                     {filtered
@@ -372,36 +402,38 @@ function SkillRow({ skill, onView }: { skill: SkillSummary; onView(): void }) {
   const { tr } = useI18n();
   return (
     <tr className="cursor-pointer transition-colors hover:bg-zinc-900/40" onClick={onView}>
-      <td className="whitespace-nowrap px-4 py-2.5">
+      <td className="whitespace-nowrap px-4 py-1.5 pl-6">
         <div className="flex items-center gap-1.5">
-          <span className="font-medium text-zinc-100">{skill.name}</span>
-          {skill.source && skill.source !== 'builtin' && (
+          <span className="text-[13px] text-zinc-200">{skill.name}</span>
+          {skill.source === 'mcp' ? (
+            <span className="rounded bg-sky-900/40 px-1 text-[9px] font-medium text-sky-300">mcp</span>
+          ) : skill.source && skill.source !== 'builtin' ? (
             <span
               className="rounded bg-violet-900/40 px-1 text-[9px] font-medium text-violet-300"
               title={tr(`作为扩展安装（${skill.source}）`, `installed as extension (${skill.source})`)}
             >
-              {tr('已安装', 'installed')}
+              {tr('扩展', 'extension')}
             </span>
-          )}
+          ) : null}
         </div>
-        <div className="mt-0.5 font-mono text-[11px] text-zinc-500" title={skill.key}>
+        <div className="font-mono text-[10px] text-zinc-600" title={skill.key}>
           {skill.key}
         </div>
       </td>
-      <td className="whitespace-nowrap px-4 py-2.5">
+      <td className="whitespace-nowrap px-4 py-1.5">
         <ScopeBadge value={skill.scope ?? 'host'} />
       </td>
-      <td className="whitespace-nowrap px-4 py-2.5">
+      <td className="whitespace-nowrap px-4 py-1.5">
         <ClassBadge value={skill.class} />
       </td>
       {/* Description column is the truncate-absorber — w-full + max-w-0
           forces it to take all remaining horizontal space and clamp
           long copy, so identity columns (name / key / badges) never
           shrink below their natural width. */}
-      <td className="w-full max-w-0 px-4 py-2.5 text-xs text-zinc-400">
-        <div className="line-clamp-2">{skill.description || '—'}</div>
+      <td className="w-full max-w-0 px-4 py-1.5 text-[11px] text-zinc-500">
+        <div className="line-clamp-1">{skill.description || '—'}</div>
       </td>
-      <td className="whitespace-nowrap px-4 py-2.5 text-right">
+      <td className="whitespace-nowrap px-4 py-1.5 text-right">
         {skill.inventory_only ? (
           <span
             title={tr(
