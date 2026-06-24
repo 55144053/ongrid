@@ -4,7 +4,6 @@ import {
   CheckCircle2,
   Loader2,
   Pencil,
-  Plug,
   PlugZap,
   Plus,
   RefreshCw,
@@ -159,12 +158,7 @@ export default function McpPage() {
   return (
     <main className="anim-fade flex flex-1 flex-col overflow-hidden">
       <PageHeader
-        title={
-          <span className="flex items-center gap-2">
-            <Plug size={18} className="text-zinc-400" />
-            {tr('MCP 服务', 'MCP servers')}
-          </span>
-        }
+        title={tr('MCP 服务', 'MCP servers')}
         subtitle={
           <>
             {tr(
