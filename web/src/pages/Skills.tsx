@@ -238,6 +238,21 @@ function CatalogTab() {
   // Keyed by the WIRE name (s.key), not the localized display name.
   const skillKey = useCallback((s: SkillSummary) => toolGroupKey(s.key, s.source, s.category), []);
   const skills = useMemo(() => orderedGroupKeys(items.map(skillKey)), [items, skillKey]);
+  // Filter chips stay bounded: the 6 built-in skills + a single "MCP" and a
+  // single "扩展" meta-chip, instead of one chip per server / pack (which would
+  // grow without limit). The TABLE still sections per server / pack.
+  const chips = useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const k of skills) {
+      const c = k.startsWith('mcp:') ? 'mcp' : k.startsWith('skill:') ? 'ext' : k;
+      if (!seen.has(c)) {
+        seen.add(c);
+        out.push(c);
+      }
+    }
+    return out;
+  }, [skills]);
 
   // Scope defaults to 'host' on the backend when omitted (skillcore.EffectiveScope),
   // so for filter purposes we treat undefined as 'host'.
@@ -256,7 +271,11 @@ function CatalogTab() {
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
     return items.filter((s) => {
-      if (category && skillKey(s) !== category) return false;
+      if (category) {
+        const gk = skillKey(s);
+        const ok = category === 'mcp' ? gk.startsWith('mcp:') : category === 'ext' ? gk.startsWith('skill:') : gk === category;
+        if (!ok) return false;
+      }
       if (scope && effectiveScope(s) !== scope) return false;
       if (!q) return true;
       return (
@@ -302,7 +321,7 @@ function CatalogTab() {
                 />
               </div>
             </div>
-            {skills.length > 0 && (
+            {chips.length > 0 && (
               <div className="inline-flex items-center gap-1.5 text-xs text-zinc-400">
                 <span className="text-zinc-500">{tr('技能', 'Skill')}</span>
                 <div className="flex flex-wrap gap-1">
@@ -311,11 +330,11 @@ function CatalogTab() {
                     label={tr('全部', 'All')}
                     onClick={() => setCategory('')}
                   />
-                  {skills.map((c) => (
+                  {chips.map((c) => (
                     <CategoryChip
                       key={c}
                       active={category === c}
-                      label={groupTitle(c, locale === 'zh-CN', items.find((s) => skillKey(s) === c)?.name)}
+                      label={c === 'mcp' ? 'MCP' : c === 'ext' ? tr('扩展', 'Extensions') : groupTitle(c, locale === 'zh-CN')}
                       onClick={() => setCategory(c)}
                     />
                   ))}

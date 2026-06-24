@@ -8,7 +8,7 @@ import { Play, Plus, Trash2, Workflow as WorkflowIcon } from 'lucide-react';
 import { createFlow, deleteFlow, listFlows, runFlow, toggleFlow, type Flow } from '@/api/flows';
 import { useI18n } from '@/i18n/locale';
 import { useAuth } from '@/store/auth';
-import { PageHeader } from '@/components/ui';
+import { PageHeader, Button } from '@/components/ui';
 
 export default function FlowsPage() {
   const { tr } = useI18n();
@@ -102,14 +102,10 @@ export default function FlowsPage() {
         )}
         actions={
           canWrite && !creating ? (
-            <button
-              type="button"
-              onClick={() => setCreating(true)}
-              className="inline-flex items-center gap-1.5 rounded-md bg-indigo-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-indigo-500"
-            >
+            <Button variant="primary" onClick={() => setCreating(true)}>
               <Plus size={14} />
               {tr('新建工作流', 'New workflow')}
-            </button>
+            </Button>
           ) : undefined
         }
       />
@@ -126,39 +122,30 @@ export default function FlowsPage() {
               if (e.key === 'Escape') setCreating(false);
             }}
             placeholder={tr('工作流名称，如：磁盘告警自动处置', 'Workflow name, e.g. disk-alert auto-remediation')}
-            className="flex-1 rounded-md border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-[13px] text-zinc-200 outline-none focus:border-indigo-500"
+            className="flex-1 rounded-md border border-zinc-800 bg-zinc-950 px-3 py-1.5 text-xs text-zinc-200 outline-none focus:border-zinc-600"
           />
-          <button
-            type="button"
-            onClick={() => void onCreate()}
-            disabled={busyId === -1 || !newName.trim()}
-            className="rounded-md bg-indigo-600 px-3 py-1.5 text-[13px] font-medium text-white hover:bg-indigo-500 disabled:opacity-50"
-          >
+          <Button variant="primary" onClick={() => void onCreate()} disabled={busyId === -1 || !newName.trim()}>
             {tr('创建', 'Create')}
-          </button>
-          <button
-            type="button"
-            onClick={() => setCreating(false)}
-            className="rounded-md px-3 py-1.5 text-[13px] text-zinc-400 hover:text-zinc-200"
-          >
+          </Button>
+          <Button variant="ghost" onClick={() => setCreating(false)}>
             {tr('取消', 'Cancel')}
-          </button>
+          </Button>
         </div>
       )}
 
       {error && (
-        <div className="mb-4 rounded-md border border-red-900/50 bg-red-950/30 px-3 py-2 text-[13px] text-red-400">{error}</div>
+        <div className="mb-4 rounded-md border border-red-900/50 bg-red-950/30 px-3 py-2 text-xs text-red-400">{error}</div>
       )}
       {notice && (
-        <div className="mb-4 rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-[13px] text-zinc-300">{notice}</div>
+        <div className="mb-4 rounded-md border border-zinc-800 bg-zinc-900/40 px-3 py-2 text-xs text-zinc-300">{notice}</div>
       )}
 
       {loading ? (
-        <div className="py-16 text-center text-[13px] text-zinc-500">{tr('加载中…', 'Loading…')}</div>
+        <div className="py-16 text-center text-xs text-zinc-500">{tr('加载中…', 'Loading…')}</div>
       ) : items.length === 0 ? (
         <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed border-zinc-800 py-16">
           <WorkflowIcon size={28} className="text-zinc-600" />
-          <div className="text-[13px] text-zinc-500">
+          <div className="text-xs text-zinc-500">
             {tr('还没有工作流。新建一个，把告警处置 / 巡检 / 通知串成自动化。', 'No workflows yet. Create one to automate remediation, inspection, or notification chains.')}
           </div>
         </div>
@@ -173,7 +160,7 @@ export default function FlowsPage() {
               <WorkflowIcon size={18} className={f.enabled ? 'text-indigo-400' : 'text-zinc-600'} />
               <div className="min-w-0 flex-1">
                 <div className="flex items-center gap-2">
-                  <span className="truncate text-[14px] font-medium text-zinc-200">{f.name}</span>
+                  <span className="truncate text-sm font-medium text-zinc-200">{f.name}</span>
                   <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[11px] text-zinc-500">v{f.version}</span>
                   {!f.enabled && (
                     <span className="rounded bg-zinc-800 px-1.5 py-0.5 text-[11px] text-zinc-500">{tr('已停用', 'Disabled')}</span>
