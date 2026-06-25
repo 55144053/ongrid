@@ -116,6 +116,14 @@ type Registry struct {
 	// nil → cloud_bash is NOT registered.
 	cloudBashProposer CloudBashProposer
 
+	// imSender wires send_im_message to the channel store + notify router.
+	// Set post-construction (cmd/main.go); nil → send_im_message NOT registered.
+	imSender IMSender
+
+	// pageStore wires serve_page to the hosted-pages store + static route.
+	// Set post-construction (cmd/main.go); nil → serve_page NOT registered.
+	pageStore PageStore
+
 	log   *slog.Logger
 	tools map[string]Tool
 }
@@ -123,6 +131,12 @@ type Registry struct {
 // SetCloudBashProposer wires the cloud_bash → approval-inbox seam. Call
 // after NewRegistry (cmd/main.go).
 func (r *Registry) SetCloudBashProposer(p CloudBashProposer) { r.cloudBashProposer = p }
+
+// SetIMSender wires send_im_message → channel store + notify router.
+func (r *Registry) SetIMSender(s IMSender) { r.imSender = s }
+
+// SetPageStore wires serve_page → hosted-pages store.
+func (r *Registry) SetPageStore(p PageStore) { r.pageStore = p }
 
 // SetAuditLister wires the audit query seam consumed by
 // query_change_events. Call after NewRegistry (cmd/main.go).

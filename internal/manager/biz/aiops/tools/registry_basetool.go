@@ -213,6 +213,12 @@ func (r *Registry) BuildBaseTools() *ToolBag {
 	if r.cloudBashProposer != nil {
 		out = append(out, NewCloudBashTool(r.cloudBashProposer, r.log))
 	}
+	if r.imSender != nil {
+		out = append(out, NewSendIMMessageTool(r.imSender, r.log))
+	}
+	if r.pageStore != nil {
+		out = append(out, NewServePageTool(r.pageStore, r.log))
+	}
 
 	threshold := envIntDefault("ONGRID_TOOLBAG_DEFERRAL_THRESHOLD", defaultDeferralThreshold)
 	bag := NewToolBag(out, threshold)

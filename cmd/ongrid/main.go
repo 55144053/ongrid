@@ -14,6 +14,8 @@ package main
 
 import (
 	"context"
+	crand "crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -1939,6 +1941,22 @@ func main() {
 		return string(out), nil
 	})
 	toolsReg.SetCloudBashProposer(cloudBashProposerShim{uc: approvalUC})
+	// send_im_message: the assistant can proactively push to a configured
+	// channel (飞书/钉钉/…), reusing the same BuildSenderFromChannel path the
+	// alert notifier + flow notify node use.
+	toolsReg.SetIMSender(imSenderShim{channels: alertRepo, router: notifyRouter})
+	// serve_page: the assistant can host a generated HTML report at an
+	// internal /pages/<token> URL. Pages live on the persistent volume; the
+	// route is registered on the mux below.
+	pagesDir := "/var/lib/ongrid/pages"
+	if d := os.Getenv("ONGRID_PAGES_DIR"); d != "" {
+		pagesDir = d
+	}
+	if err := os.MkdirAll(pagesDir, 0o755); err != nil {
+		log.Warn("serve_page: mkdir pages dir failed; serve_page disabled", slog.String("dir", pagesDir), slog.Any("err", err))
+	} else {
+		toolsReg.SetPageStore(filePageStore{dir: pagesDir, log: log.With(slog.String("comp", "serve_page"))})
+	}
 	// The chat runtime's tool bag was compiled far above (line ~1274)
 	// BEFORE the cloud_bash proposer existed, so that BuildBaseTools didn't
 	// yield cloud_bash. SetCloudBashProposer fixes /v1/skills and any FRESH
@@ -2136,6 +2154,24 @@ func main() {
 		// can't carry our manager JWT. Auth comes from the platform
 		// signature scheme inside the handler.
 		imbridgeHandler.RegisterPublic(api)
+		// serve_page: public read of an assistant-hosted HTML page (under /api
+		// so nginx proxies it to the manager). The random token IS the
+		// capability; id is validated to block path traversal.
+		api.Get("/pages/{id}", func(w http.ResponseWriter, r *http.Request) {
+			id := chi.URLParam(r, "id")
+			if !isHexToken(id) {
+				http.NotFound(w, r)
+				return
+			}
+			b, err := os.ReadFile(filepath.Join(pagesDir, id+".html"))
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			_, _ = w.Write(b)
+		})
 		// (admin endpoints registered inside the protected group below)
 
 		api.Group(func(protected chi.Router) {
@@ -3991,6 +4027,85 @@ func (s flowLLMRunner) RunLLM(ctx context.Context, system, user string) (string,
 		return "", err
 	}
 	return resp.Assistant.Content, nil
+}
+
+// imSenderShim implements aiopstools.IMSender (the send_im_message tool seam)
+// over the alert channel store + notify router — same BuildSenderFromChannel
+// path the alert notifier / flow notify node use.
+type imSenderShim struct {
+	channels *manageralertdata.Repo
+	router   *notify.Router
+}
+
+func (s imSenderShim) ListIMChannels(ctx context.Context) ([]aiopstools.IMChannel, error) {
+	chs, err := s.channels.ListChannels(ctx, managerbizalert.ChannelFilter{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]aiopstools.IMChannel, 0, len(chs))
+	for _, ch := range chs {
+		if !ch.Enabled {
+			continue
+		}
+		out = append(out, aiopstools.IMChannel{ID: ch.ID, Name: ch.Name, Kind: ch.ChannelType})
+	}
+	return out, nil
+}
+
+func (s imSenderShim) SendIM(ctx context.Context, channelID uint64, title, text string) error {
+	ch, err := s.channels.GetChannelByID(ctx, channelID)
+	if err != nil {
+		return fmt.Errorf("channel %d: not found", channelID)
+	}
+	if !ch.Enabled {
+		return fmt.Errorf("channel %q: disabled", ch.Name)
+	}
+	sender, err := managerbizalert.BuildSenderFromChannel(ch)
+	if err != nil {
+		return err
+	}
+	msg := notify.Message{
+		Subject:    title,
+		Body:       text,
+		Severity:   notify.SeverityInfo,
+		Source:     "assistant",
+		OccurredAt: time.Now().UTC(),
+	}
+	return s.router.SendVia(ctx, msg, sender)
+}
+
+// filePageStore implements aiopstools.PageStore (the serve_page seam) by
+// writing each page to a file on the persistent volume, served back at
+// /pages/<id>. id is a random hex token = the capability (unguessable URL).
+type filePageStore struct {
+	dir string
+	log *slog.Logger
+}
+
+func (s filePageStore) SavePage(_ context.Context, _ string, html string) (string, string, error) {
+	var rb [12]byte
+	if _, err := crand.Read(rb[:]); err != nil {
+		return "", "", fmt.Errorf("rand: %w", err)
+	}
+	id := hex.EncodeToString(rb[:])
+	if err := os.WriteFile(filepath.Join(s.dir, id+".html"), []byte(html), 0o644); err != nil {
+		return "", "", fmt.Errorf("write page: %w", err)
+	}
+	return id, "/api/pages/" + id, nil
+}
+
+// isHexToken guards the /pages/{id} route against path traversal — id must be
+// a bare lowercase-hex token.
+func isHexToken(s string) bool {
+	if len(s) < 16 || len(s) > 64 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }
 
 // flowNotifierShim implements bizflow.Notifier over the alert channel
