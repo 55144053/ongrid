@@ -422,6 +422,15 @@ html.light .app-header {
 html.light *:focus-visible {
   outline-color: rgb(148 163 184); /* slate-400 — soft, not black */
 }
+/* Text controls already signal focus by darkening their own border
+   (focus:border-…), so the offset focus ring is redundant and reads as a
+   floating outer frame. Drop it on inputs; keep it for buttons/links where the
+   ring is the only focus affordance. */
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+}
 
 /* Markdown body styling within assistant bubbles */
 .md-body {
