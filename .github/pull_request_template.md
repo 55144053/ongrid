@@ -4,4 +4,4 @@
 
 ## Author confirmation
 
-- [ ] I have read and agree to the project contribution guide in [CONTRIBUTING.md](CONTRIBUTING.md).
+- [ ] I have read and agree to the project contribution guide. Guide: https://github.com/ongridio/ongrid/blob/main/CONTRIBUTING.md
