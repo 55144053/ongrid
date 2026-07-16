@@ -201,8 +201,8 @@ kubectl delete namespace ongrid-system --ignore-not-found
 | --- | --- | --- |
 | DaemonSet 复用同一 edge 凭证 | 多节点互相覆盖在线状态和 `device_id` | 使用 bootstrap token 换取 per-node edge credentials |
 | Node Pod 读取共享凭据 Secret | 单节点失陷后可读取或覆盖其他节点密钥 | 每个节点只在宿主机本地持久化自己的 `0600` 凭据文件；ServiceAccount 仅允许读取 `kube-system` Namespace 以校验集群 UID |
-| Node 启动阶段需要进入宿主机 mount namespace | 启动进程短暂持有 `SYS_ADMIN`、`SYS_PTRACE` 等高权限 | 仅固定的内置 launcher 获得最小 capability；进入宿主机后立即降 UID、清空补充组和 capability bounding set，只保留 `NET_ADMIN`、`DAC_READ_SEARCH`，不使用 `privileged: true` |
-| Node Edge 需要与主机安装版一致地读取和修改宿主机文件 | launcher 通过 hostPID 的 `/proc/1/root` 进入节点真实根目录 | Controller 保持隔离；launcher 进入主机后立即以 UID/GID 65532 运行，写操作继续受 Edge 审批与审计链路约束 |
+| Node 启动阶段需要切换到宿主机根文件系统 | 启动进程短暂持有 `SYS_CHROOT` 等最小 capability | Chart 将宿主机 `/` 显式挂载到 `/host/root` 并使用 `HostToContainer` 传播；launcher 完成 `chroot` 后立即降 UID、清空补充组和 capability bounding set，只保留 `NET_ADMIN`、`DAC_READ_SEARCH`，不使用 `privileged: true` |
+| Node Edge 需要与主机安装版一致地读取和修改宿主机文件 | launcher 直接进入 `/host/root`，不依赖受 ptrace、AppArmor/SELinux 或 user namespace 限制的 `/proc/1/root` 与 mount namespace `setns` | Controller 保持隔离；launcher 进入主机后立即以 UID/GID 65532 运行，写操作继续受 Edge 审批与审计链路约束；旧 Chart 的 `/proc/1/root` 参数仍保留兼容路径 |
 | CNB 公共镜像仓库不可达 | Controller 和 Node Edge 出现 ImagePullBackOff | release 先发布并校验 amd64/arm64 多架构 manifest；受限环境通过 `image.repository` 覆盖为集群可达镜像仓库 |
 | 可选 kube-state-metrics 访问公网 | 离线环境启用后出现 ImagePullBackOff | 默认关闭；启用时必须显式提供集群可达的离线镜像仓库地址 |
 | Event 高 churn | MySQL 表膨胀 | 当前快照 prune + TTL + per-cluster cap |
