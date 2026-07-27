@@ -301,9 +301,12 @@ telemetryGateway:
     maxReplicas: 10
     targetCPUUtilizationPercentage: 60
     # 使用 AverageValue，而不是相对 memory request 的 Utilization。
-    # 默认 600Mi，先于 640Mi soft limit（768Mi - 128Mi spike）扩容。
-    targetMemoryAverageValue: 600Mi
+    # 默认 512Mi，为 640Mi soft limit（768Mi - 128Mi spike）的 80%，
+    # 给 HPA 容忍区间和指标采样/调度延迟保留余量。
+    targetMemoryAverageValue: 512Mi
     scaleDownStabilizationWindowSeconds: 300
+    scaleDownMaxPods: 1
+    scaleDownPeriodSeconds: 60
   resources:
     requests:
       cpu: 200m
@@ -335,6 +338,7 @@ kubernetesMetrics:
 - HPA 最小副本数不得小于 2；
 - HPA 开启时 Deployment manifest 不渲染 `spec.replicas`，副本数只由 HPA 持有，后续 Helm/镜像升级不得重置实时副本数；
 - 内存 HPA 使用明确的 `averageValue`，不能把 limit 百分比误写成 request 利用率；
+- 扩容显式保持 Kubernetes 的快速默认策略（每 15 秒最多增加 100% 或 4 个 Pod，取较大值）；缩容稳定 300 秒后每 60 秒最多减少 1 个 Pod，给内存队列和长连接留出排空时间；
 - `PodDisruptionBudget.minAvailable: 1`；
 - 使用 `topologySpreadConstraints`，尽量分散到不同 Node/zone；
 - `RollingUpdate.maxUnavailable: 0`、`maxSurge: 1`；
@@ -610,3 +614,4 @@ Hook 会先停止 Metrics Scraper，最终 manifest 再恢复 Controller 的 emb
 | 2026-07-22 | ADR 接受后启动实现；增加独立数据面凭据、部署模板、有界队列，以及 KSM 无重叠迁移闸门 | Codex |
 | 2026-07-27 | 将多次人工切换收敛为单次原子 Helm upgrade；增加幂等 pre-upgrade Hook、稳定 Service selector 和纯镜像升级无 PATCH 保证 | Codex |
 | 2026-07-27 | Gateway HPA 改为默认开启；HPA 独占副本数，固定副本模式保留为无 Metrics API 集群的回滚选项 | Codex |
+| 2026-07-27 | HPA 内存目标降至 soft limit 的 80%；显式保留快速扩容，并限制缩容为每分钟一个 Pod | Codex |

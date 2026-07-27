@@ -163,9 +163,13 @@ telemetryGateway:
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilizationPercentage: 60
-    # Scale before memory_limiter's 640Mi soft limit (768Mi - 128Mi spike).
-    targetMemoryAverageValue: 600Mi
+    # Keep the target at no more than 80% of memory_limiter's 640Mi soft limit
+    # (768Mi - 128Mi spike), leaving headroom for HPA tolerance and sampling lag.
+    targetMemoryAverageValue: 512Mi
     scaleDownStabilizationWindowSeconds: 300
+    # Drain in-memory telemetry gradually after the stabilization window.
+    scaleDownMaxPods: 1
+    scaleDownPeriodSeconds: 60
   podDisruptionBudget:
     enabled: true
     minAvailable: 1

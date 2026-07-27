@@ -58,7 +58,12 @@ grep -q 'kind: HorizontalPodAutoscaler' "$tmp_dir/default.yaml"
 grep -q 'minReplicas: 2' "$tmp_dir/default.yaml"
 grep -q 'maxReplicas: 10' "$tmp_dir/default.yaml"
 grep -q 'averageUtilization: 60' "$tmp_dir/default.yaml"
-grep -q 'averageValue: 600Mi' "$tmp_dir/default.yaml"
+grep -q 'averageValue: 512Mi' "$tmp_dir/default.yaml"
+grep -A12 '^    scaleUp:' "$tmp_dir/default.yaml" | grep -q 'value: 100'
+grep -A12 '^    scaleUp:' "$tmp_dir/default.yaml" | grep -q 'value: 4'
+grep -A8 '^    scaleDown:' "$tmp_dir/default.yaml" | grep -q 'stabilizationWindowSeconds: 300'
+grep -A8 '^    scaleDown:' "$tmp_dir/default.yaml" | grep -q 'value: 1'
+grep -A8 '^    scaleDown:' "$tmp_dir/default.yaml" | grep -q 'periodSeconds: 60'
 ! grep -q '^  replicas:' "$tmp_dir/default-gateway.yaml"
 ! grep -q '# Source: ongrid-edge/templates/upgrade-preflight.yaml' "$tmp_dir/default.yaml"
 ! grep -q 'ONGRID_K8S_METRICS_ENDPOINT\|containerPort: 4317\|containerPort: 4318' "$tmp_dir/default-controller.yaml"
@@ -208,12 +213,18 @@ helm template hpa "$chart_package" "${common_args[@]}" \
   --set telemetryGateway.autoscaling.enabled=true \
   --set telemetryGateway.autoscaling.minReplicas=3 \
   --set telemetryGateway.autoscaling.maxReplicas=12 \
+  --set telemetryGateway.autoscaling.scaleDownStabilizationWindowSeconds=0 \
+  --set telemetryGateway.autoscaling.scaleDownMaxPods=2 \
+  --set telemetryGateway.autoscaling.scaleDownPeriodSeconds=120 \
   >"$tmp_dir/hpa.yaml"
 grep -q '# Source: ongrid-edge/templates/telemetry-gateway-policy.yaml' "$tmp_dir/hpa.yaml"
 grep -q 'kind: HorizontalPodAutoscaler' "$tmp_dir/hpa.yaml"
 grep -q 'minReplicas: 3' "$tmp_dir/hpa.yaml"
 grep -q 'maxReplicas: 12' "$tmp_dir/hpa.yaml"
-grep -q 'averageValue: 600Mi' "$tmp_dir/hpa.yaml"
+grep -q 'averageValue: 512Mi' "$tmp_dir/hpa.yaml"
+grep -A8 '^    scaleDown:' "$tmp_dir/hpa.yaml" | grep -q 'stabilizationWindowSeconds: 0'
+grep -A8 '^    scaleDown:' "$tmp_dir/hpa.yaml" | grep -q 'value: 2'
+grep -A8 '^    scaleDown:' "$tmp_dir/hpa.yaml" | grep -q 'periodSeconds: 120'
 
 helm template fixed-gateway "$chart_package" "${common_args[@]}" \
   --set telemetryGateway.autoscaling.enabled=false \
@@ -232,8 +243,16 @@ expect_template_failure 'telemetryGateway.memoryLimiter.limitMiB must be at most
   helm template invalid-limiter "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.memoryLimiter.limitMiB=900
 expect_template_failure 'telemetryGateway.batch requires 0 < sendSize <= maxSize <= 4096' \
   helm template invalid-batch "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.batch.maxSize=5000
-expect_template_failure 'targetMemoryAverageValue must be below the memory_limiter soft limit' \
-  helm template invalid-hpa "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.autoscaling.enabled=true --set telemetryGateway.autoscaling.targetMemoryAverageValue=650Mi
+expect_template_failure 'targetMemoryAverageValue must be positive and at most 80% of the memory_limiter soft limit' \
+  helm template invalid-hpa-memory "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.autoscaling.enabled=true --set telemetryGateway.autoscaling.targetMemoryAverageValue=600Mi
+expect_template_failure 'targetCPUUtilizationPercentage must be between 1 and 100' \
+  helm template invalid-hpa-cpu "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.autoscaling.enabled=true --set telemetryGateway.autoscaling.targetCPUUtilizationPercentage=0
+expect_template_failure 'scaleDownMaxPods must be at least 1' \
+  helm template invalid-hpa-scale-down-pods "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.autoscaling.enabled=true --set telemetryGateway.autoscaling.scaleDownMaxPods=-1
+expect_template_failure 'scaleDownStabilizationWindowSeconds must be between 0 and 3600' \
+  helm template invalid-hpa-scale-down-window "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.autoscaling.enabled=true --set telemetryGateway.autoscaling.scaleDownStabilizationWindowSeconds=3601
+expect_template_failure 'scaleDownPeriodSeconds must be between 1 and 1800' \
+  helm template invalid-hpa-scale-down-period "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.autoscaling.enabled=true --set telemetryGateway.autoscaling.scaleDownPeriodSeconds=1801
 expect_template_failure 'upgrade.migrationHook.timeout must be a whole second, minute, or hour duration' \
   helm template invalid-upgrade-timeout "$chart_package" "${common_args[@]}" --is-upgrade --set upgrade.migrationHook.timeout=1m30s
 
