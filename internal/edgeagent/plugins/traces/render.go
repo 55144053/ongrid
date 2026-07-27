@@ -160,13 +160,13 @@ exporters:
 {{- if .LogsEnabled }}
   loki/manager:
     endpoint: {{ .LogsEndpoint }}
-    {{- if .TLSInsecureSkipVerify }}
+    {{- if .LogsTLSInsecureSkipVerify }}
     tls:
       insecure_skip_verify: true
     {{- end }}
-    {{- if .AuthHeader }}
+    {{- if .LogsAuthHeader }}
     headers:
-      Authorization: "{{ .AuthHeader }}"
+      Authorization: "{{ .LogsAuthHeader }}"
     {{- end }}
     default_labels_enabled:
       exporter: false
@@ -267,6 +267,9 @@ service:
 //	enable_k8sattributes : bool (default false; true for Kubernetes gateway collectors)
 //	enable_logs : bool (default false; true for Kubernetes telemetry gateway)
 //	logs_endpoint : string (required when enable_logs=true; Loki push URL)
+//	logs_auth_override : bool (use logs_auth_* instead of trace auth)
+//	logs_auth_user / logs_auth_pass / logs_auth_bearer : string
+//	logs_tls_insecure_skip_verify : bool (defaults to trace TLS policy)
 //	enable_metrics : bool (default false; true for Kubernetes telemetry gateway)
 //	metrics_export_endpoint : string (required when enable_metrics=true; local scrape endpoint)
 //
@@ -336,6 +339,20 @@ func render(cfg plugins.PluginConfig) ([]byte, error) {
 			authHeader = "Bearer " + cfg.AuthPass
 		}
 	}
+	logsAuthHeader := authHeader
+	if boolSpec(cfg.Spec, "logs_auth_override") {
+		logsAuthHeader = authHeaderFromValues(
+			stringOr(cfg.Spec, "logs_auth_user", ""),
+			stringOr(cfg.Spec, "logs_auth_pass", ""),
+			stringOr(cfg.Spec, "logs_auth_bearer", ""),
+		)
+	}
+	logsTLSInsecure := tlsInsecure
+	if v, ok := cfg.Spec["logs_tls_insecure_skip_verify"]; ok {
+		if b, ok := v.(bool); ok {
+			logsTLSInsecure = b
+		}
+	}
 	metricsAuthHeader := authHeaderFromValues(
 		stringOr(cfg.Spec, "metrics_remote_write_auth_user", ""),
 		stringOr(cfg.Spec, "metrics_remote_write_auth_pass", ""),
@@ -356,6 +373,8 @@ func render(cfg plugins.PluginConfig) ([]byte, error) {
 		"K8sAttributesEnabled":       k8sAttributes,
 		"LogsEnabled":                logsEnabled,
 		"LogsEndpoint":               logsEndpoint,
+		"LogsAuthHeader":             logsAuthHeader,
+		"LogsTLSInsecureSkipVerify":  logsTLSInsecure,
 		"MetricsEnabled":             metricsEnabled,
 		"MetricsExportEndpoint":      metricsExportEndpoint,
 		"MetricsRemoteWriteEnabled":  metricsRemoteWriteEnabled,

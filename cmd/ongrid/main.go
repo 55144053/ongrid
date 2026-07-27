@@ -804,6 +804,7 @@ func main() {
 		loki:      lokiResolver,
 		tempo:     tempoResolver,
 	}
+	k8sUC.SetTelemetryTargetResolver(pluginEndpointResolver)
 	pluginConfigUC := managerbizedge.NewPluginConfigUC(pluginConfigRepo, nil, pluginEndpointResolver, log)
 
 	edgeHandler := managerserveredge.NewHandler(edgeSvc, deviceRepo, pluginConfigUC)
@@ -2625,39 +2626,72 @@ func (i k8sEdgeIdentityIssuer) DeleteEdge(ctx context.Context, edgeID uint64) er
 // overridden the seed and we should fall through to PublicURL.
 type pluginEndpointResolver struct {
 	publicURL string
-	loki      *managerbizsetting.LokiResolver
-	tempo     *managerbizsetting.TempoResolver
+	loki      telemetryBackendResolver
+	tempo     telemetryBackendResolver
+}
+
+type telemetryBackendResolver interface {
+	URL(ctx context.Context) string
+	Auth(ctx context.Context) (basicUser, basicPassword string)
+	TLSInsecure(ctx context.Context) bool
 }
 
 func (r pluginEndpointResolver) Endpoint(ctx context.Context, plugin string) string {
-	switch plugin {
+	target, err := r.ResolveTelemetryTarget(ctx, plugin)
+	if err != nil {
+		return ""
+	}
+	return target.Endpoint
+}
+
+func (r pluginEndpointResolver) ResolveTelemetryTarget(ctx context.Context, signal string) (managerbizk8s.TelemetryTarget, error) {
+	switch signal {
 	case "logs":
 		if r.loki != nil {
 			if u := edgeReachableLokiURL(r.loki.URL(ctx)); u != "" {
-				return u + "/loki/api/v1/push"
+				user, password := r.loki.Auth(ctx)
+				return managerbizk8s.TelemetryTarget{
+					Endpoint:      u + "/loki/api/v1/push",
+					BasicUser:     user,
+					BasicPassword: password,
+					TLSInsecure:   r.loki.TLSInsecure(ctx),
+				}, nil
 			}
 		}
 		if r.publicURL == "" {
-			return ""
+			return managerbizk8s.TelemetryTarget{}, nil
 		}
-		return r.publicURL + "/loki/api/v1/push"
+		return managerbizk8s.TelemetryTarget{
+			Endpoint:               strings.TrimRight(r.publicURL, "/") + "/loki/api/v1/push",
+			UseTelemetryCredential: true,
+		}, nil
 	case "traces":
 		if r.tempo != nil {
 			if u := edgeReachableTempoURL(r.tempo.URL(ctx)); u != "" {
 				// If the admin URL already includes /v1/traces (some
 				// OTLP endpoints publish the path inline), respect it.
-				if strings.HasSuffix(u, "/v1/traces") {
-					return u
+				endpoint := u
+				if !strings.HasSuffix(endpoint, "/v1/traces") {
+					endpoint += "/v1/traces"
 				}
-				return u + "/v1/traces"
+				user, password := r.tempo.Auth(ctx)
+				return managerbizk8s.TelemetryTarget{
+					Endpoint:      endpoint,
+					BasicUser:     user,
+					BasicPassword: password,
+					TLSInsecure:   r.tempo.TLSInsecure(ctx),
+				}, nil
 			}
 		}
 		if r.publicURL == "" {
-			return ""
+			return managerbizk8s.TelemetryTarget{}, nil
 		}
-		return r.publicURL + "/v1/traces"
+		return managerbizk8s.TelemetryTarget{
+			Endpoint:               strings.TrimRight(r.publicURL, "/") + "/v1/traces",
+			UseTelemetryCredential: true,
+		}, nil
 	}
-	return ""
+	return managerbizk8s.TelemetryTarget{}, nil
 }
 
 // edgeReachableLokiURL returns the URL when it looks like an

@@ -6,6 +6,11 @@
 {{- $kubernetesMetricsEnabled := eq (include "ongrid-edge.kubernetesMetricsEnabled" .) "true" -}}
 {{- $controllerMetricsMode := and $kubernetesMetricsEnabled (eq (include "ongrid-edge.kubernetesMetricsMode" .) "controller") -}}
 {{- $telemetryDataPlaneRequired := or (and $telemetryGatewayEnabled (eq (include "ongrid-edge.telemetryGatewayMode" .) "deployment")) (and $kubernetesMetricsEnabled (eq (include "ongrid-edge.kubernetesMetricsMode" .) "scraper")) -}}
+{{- $controllerInventory := default dict .Values.controller.inventory -}}
+{{- $controllerConfigChecksum := printf "%s\n%s\n%s\n%v\n%s" .Values.mode .Values.manager.publicURL .Values.manager.tunnelAddr (default true $controllerInventory.watch) (default "10m" $controllerInventory.fullSyncInterval) | sha256sum -}}
+{{- if $controllerMetricsMode -}}
+{{- $controllerConfigChecksum = include (print $.Template.BasePath "/configmap.yaml") . | sha256sum -}}
+{{- end -}}
 {{- if ne (int .Values.controller.replicas) 1 -}}
 {{- fail "controller.replicas must be 1 until controller leader election is implemented" -}}
 {{- end -}}
@@ -28,6 +33,9 @@ spec:
       app.kubernetes.io/component: controller
   template:
     metadata:
+      annotations:
+        checksum/config: {{ $controllerConfigChecksum }}
+        checksum/controller-bootstrap: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
       labels:
         {{- include "ongrid-edge.labels" . | nindent 8 }}
         app.kubernetes.io/component: controller

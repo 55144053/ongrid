@@ -32,6 +32,8 @@ const (
 	eventRetentionBatchLimit    = 1000
 	bootstrapTokenBytes         = 32
 	defaultK8sChartRef          = "oci://helm.cnb.cool/ongridio/ongrid-edge"
+	telemetryAuthModeTelemetry  = "telemetry"
+	telemetryAuthModeBackend    = "backend"
 )
 
 // Repository is the k8s bounded context persistence contract.
@@ -184,12 +186,34 @@ type RemoteWriteResolver interface {
 	ResolveRemoteWrite(ctx context.Context) (RemoteWriteTarget, error)
 }
 
+const (
+	TelemetrySignalTraces = "traces"
+	TelemetrySignalLogs   = "logs"
+)
+
+// TelemetryTarget is an exact trace or log destination published to a
+// Kubernetes telemetry gateway. Manager-proxied targets use the cluster's
+// telemetry credential; external targets carry only their backend-specific
+// basic auth and TLS policy.
+type TelemetryTarget struct {
+	Endpoint               string
+	BasicUser              string
+	BasicPassword          string
+	TLSInsecure            bool
+	UseTelemetryCredential bool
+}
+
+type TelemetryTargetResolver interface {
+	ResolveTelemetryTarget(ctx context.Context, signal string) (TelemetryTarget, error)
+}
+
 type Usecase struct {
 	repo               Repository
 	edgeIssuer         EdgeIssuer
 	edgeRemover        EdgeRemover
 	topology           TopologyMirror
 	remoteWrite        RemoteWriteResolver
+	telemetryTargets   TelemetryTargetResolver
 	cfg                Config
 	enrollmentLocksMu  sync.Mutex
 	enrollmentLocks    map[string]*enrollmentLock
@@ -230,6 +254,10 @@ func (u *Usecase) SetTopologyMirror(m TopologyMirror) { u.topology = m }
 // SetRemoteWriteResolver wires the active Prometheus-compatible write target.
 // It is called once during manager startup before the HTTP server is exposed.
 func (u *Usecase) SetRemoteWriteResolver(r RemoteWriteResolver) { u.remoteWrite = r }
+
+// SetTelemetryTargetResolver wires the active Loki and Tempo ingest targets.
+// It is called once during manager startup before the HTTP server is exposed.
+func (u *Usecase) SetTelemetryTargetResolver(r TelemetryTargetResolver) { u.telemetryTargets = r }
 
 func (u *Usecase) EventCleanupInterval() time.Duration {
 	if u == nil || u.cfg.EventCleanupInterval <= 0 {
@@ -1027,7 +1055,15 @@ type TelemetryConfig struct {
 	AccessKey              string
 	SecretKey              string
 	TracesEndpoint         string
+	TracesAuthMode         string
+	TracesBasicUser        string
+	TracesBasicPass        string
+	TracesTLSInsecure      bool
 	LogsEndpoint           string
+	LogsAuthMode           string
+	LogsBasicUser          string
+	LogsBasicPass          string
+	LogsTLSInsecure        bool
 	RemoteWriteEndpoint    string
 	RemoteWriteBearer      string
 	RemoteWriteBasicUser   string
@@ -1910,12 +1946,28 @@ func newTelemetryCredential(clusterID uint64) (*model.TelemetryCredential, strin
 func (u *Usecase) resolveTelemetryConfig(ctx context.Context, clusterID uint64, accessKey, secretKey string) (*TelemetryConfig, error) {
 	publicURL := strings.TrimRight(strings.TrimSpace(u.cfg.PublicURL), "/")
 	out := &TelemetryConfig{
-		ClusterID:      clusterID,
-		AccessKey:      accessKey,
-		SecretKey:      secretKey,
-		TracesEndpoint: endpointPath(publicURL, "/v1/traces"),
-		LogsEndpoint:   endpointPath(publicURL, "/loki/api/v1/push"),
+		ClusterID: clusterID,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
 	}
+	traces, err := u.resolveTelemetryTarget(ctx, TelemetrySignalTraces, endpointPath(publicURL, "/v1/traces"))
+	if err != nil {
+		return nil, err
+	}
+	logs, err := u.resolveTelemetryTarget(ctx, TelemetrySignalLogs, endpointPath(publicURL, "/loki/api/v1/push"))
+	if err != nil {
+		return nil, err
+	}
+	out.TracesEndpoint = traces.Endpoint
+	out.TracesAuthMode = traces.AuthMode
+	out.TracesBasicUser = traces.BasicUser
+	out.TracesBasicPass = traces.BasicPass
+	out.TracesTLSInsecure = traces.TLSInsecure
+	out.LogsEndpoint = logs.Endpoint
+	out.LogsAuthMode = logs.AuthMode
+	out.LogsBasicUser = logs.BasicUser
+	out.LogsBasicPass = logs.BasicPass
+	out.LogsTLSInsecure = logs.TLSInsecure
 	target := RemoteWriteTarget{
 		Endpoint:               endpointPath(publicURL, "/prometheus/api/v1/write"),
 		UseTelemetryCredential: true,
@@ -1939,6 +1991,45 @@ func (u *Usecase) resolveTelemetryConfig(ctx context.Context, clusterID uint64, 
 		out.RemoteWriteBearer = target.BearerToken
 		out.RemoteWriteBasicUser = target.BasicUser
 		out.RemoteWriteBasicPass = target.BasicPassword
+	}
+	return out, nil
+}
+
+type resolvedTelemetryTarget struct {
+	Endpoint    string
+	AuthMode    string
+	BasicUser   string
+	BasicPass   string
+	TLSInsecure bool
+}
+
+func (u *Usecase) resolveTelemetryTarget(ctx context.Context, signal, fallbackEndpoint string) (resolvedTelemetryTarget, error) {
+	target := TelemetryTarget{
+		Endpoint:               fallbackEndpoint,
+		UseTelemetryCredential: true,
+	}
+	if u.telemetryTargets != nil {
+		resolved, err := u.telemetryTargets.ResolveTelemetryTarget(ctx, signal)
+		if err != nil {
+			return resolvedTelemetryTarget{}, fmt.Errorf("resolve kubernetes %s target: %w", signal, err)
+		}
+		if strings.TrimSpace(resolved.Endpoint) != "" {
+			target = resolved
+		}
+	}
+	out := resolvedTelemetryTarget{
+		Endpoint:    strings.TrimSpace(target.Endpoint),
+		TLSInsecure: target.TLSInsecure,
+	}
+	if target.UseTelemetryCredential {
+		out.AuthMode = telemetryAuthModeTelemetry
+		return out, nil
+	}
+	out.AuthMode = telemetryAuthModeBackend
+	out.BasicUser = strings.TrimSpace(target.BasicUser)
+	out.BasicPass = strings.TrimSpace(target.BasicPassword)
+	if (out.BasicUser == "") != (out.BasicPass == "") {
+		return resolvedTelemetryTarget{}, fmt.Errorf("resolve kubernetes %s target: basic auth requires both username and password", signal)
 	}
 	return out, nil
 }

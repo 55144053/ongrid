@@ -93,19 +93,25 @@ kubernetesMetrics:
   # standalone Scraper starts, so fresh installs and upgrades share one target.
   mode: scraper
   # Manual emergency gate. While false, neither the Controller nor the
-  # standalone Scraper reads kube-state-metrics; normal upgrades keep it true.
-  enabled: true
+  # standalone Scraper reads metrics. Null preserves legacy
+  # controller.metrics.enabled / kubeStateMetrics.enabled values on upgrade.
+  enabled: null
   # First phase is intentionally single-active; values other than 1 fail
   # template validation when mode=scraper.
   replicas: 1
   serviceAccountName: ""
-  endpoint: ""
-  interval: 30s
-  timeout: 15s
-  pushTimeout: 30s
-  sampleLimit: 250000
-  batchSampleLimit: 10000
-  batchByteLimit: 4194304
+  # Null values inherit the corresponding controller.metrics.* setting. This
+  # keeps --reset-then-reuse-values compatible with releases from before the
+  # standalone Scraper existed while allowing an explicit new value to win.
+  endpoint: null
+  interval: null
+  timeout: null
+  pushTimeout: null
+  sampleLimit: null
+  batchSampleLimit: null
+  batchByteLimit: null
+  appDiscovery:
+    enabled: null
   maxRetries: 3
   retryBackoff: 500ms
   resources:

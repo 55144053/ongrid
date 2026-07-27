@@ -43,6 +43,8 @@ helm lint "$chart_dir" "${common_args[@]}"
 helm template ongrid-edge "$chart_package" "${common_args[@]}" >"$tmp_dir/default.yaml"
 extract_source 'ongrid-edge/templates/telemetry-credentials-secret.yaml' "$tmp_dir/default.yaml" "$tmp_dir/telemetry-secret.yaml"
 extract_source 'ongrid-edge/templates/deployment.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-controller.yaml"
+extract_source 'ongrid-edge/templates/daemonset.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-node.yaml"
+extract_source 'ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-scraper.yaml"
 extract_source 'ongrid-edge/templates/telemetry-gateway-service.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-gateway-service.yaml"
 grep -q 'type: Recreate' "$tmp_dir/default.yaml"
 ! grep -q 'kubernetes.io/arch:' "$tmp_dir/default.yaml"
@@ -55,6 +57,13 @@ grep -q '# Source: ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_
 ! grep -q 'ONGRID_K8S_METRICS_ENDPOINT\|containerPort: 4317\|containerPort: 4318' "$tmp_dir/default-controller.yaml"
 grep -q 'ongrid.io/telemetry-backend: "false"' "$tmp_dir/default-controller.yaml"
 grep -q 'ongrid.io/telemetry-backend: "true"' "$tmp_dir/default-gateway-service.yaml"
+test "$(grep -F -c 'checksum/config:' "$tmp_dir/default.yaml")" -eq 3
+grep -q 'checksum/controller-bootstrap:' "$tmp_dir/default-controller.yaml"
+grep -q 'checksum/node-bootstrap:' "$tmp_dir/default.yaml"
+# kube-state-metrics, the telemetry gateway k8sattributes processor, and the
+# controller each need the same read-only workload ownership resources.
+test "$(grep -F -c 'resources: ["deployments", "statefulsets", "daemonsets", "replicasets"]' "$tmp_dir/default.yaml")" -ge 3
+test "$(grep -F -c 'resources: ["jobs", "cronjobs"]' "$tmp_dir/default.yaml")" -ge 3
 grep -q 'k8s-inventory-full-sync-interval: "10m"' "$tmp_dir/default.yaml"
 grep -q 'k8s-metrics-timeout: "15s"' "$tmp_dir/default.yaml"
 grep -q 'k8s-metrics-push-timeout: "30s"' "$tmp_dir/default.yaml"
@@ -105,7 +114,64 @@ grep -q '# Source: ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_
 grep -A1 'name: ONGRID_K8S_TELEMETRY_REQUIRED' "$tmp_dir/split-controller.yaml" | grep -q 'value: "true"'
 grep -q 'replicas: 1' "$tmp_dir/scraper.yaml"
 grep -q 'automountServiceAccountToken: false' "$tmp_dir/scraper.yaml"
+grep -q 'name: ONGRID_K8S_APP_METRICS_DISCOVERY' "$tmp_dir/scraper.yaml"
 ! grep -q 'telemetry-access-key\|telemetry-secret-key\|telemetry-traces-endpoint\|telemetry-logs-endpoint' "$tmp_dir/scraper.yaml"
+
+# Values persisted by Charts before kubernetesMetrics existed must continue to
+# drive the standalone Scraper after --reset-then-reuse-values.
+helm template legacy-external "$chart_package" "${common_args[@]}" \
+  --set kubeStateMetrics.enabled=false \
+  --set controller.metrics.enabled=true \
+  --set-string controller.metrics.endpoint=http://metrics.monitoring.svc:9090/metrics \
+  --set-string controller.metrics.interval=2m \
+  --set-string controller.metrics.timeout=45s \
+  --set-string controller.metrics.pushTimeout=1m \
+  --set controller.metrics.sampleLimit=123456 \
+  --set controller.metrics.batchSampleLimit=4321 \
+  --set controller.metrics.batchByteLimit=2097152 \
+  >"$tmp_dir/legacy-external.yaml"
+grep -q '# Source: ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/legacy-external.yaml"
+grep -q 'k8s-metrics-endpoint: "http://metrics.monitoring.svc:9090/metrics"' "$tmp_dir/legacy-external.yaml"
+grep -q 'k8s-metrics-interval: "2m"' "$tmp_dir/legacy-external.yaml"
+grep -q 'k8s-metrics-timeout: "45s"' "$tmp_dir/legacy-external.yaml"
+grep -q 'k8s-metrics-push-timeout: "1m"' "$tmp_dir/legacy-external.yaml"
+grep -q 'k8s-metrics-sample-limit: "123456"' "$tmp_dir/legacy-external.yaml"
+grep -q 'k8s-metrics-batch-sample-limit: "4321"' "$tmp_dir/legacy-external.yaml"
+grep -q 'k8s-metrics-batch-byte-limit: "2097152"' "$tmp_dir/legacy-external.yaml"
+
+helm template explicit-new-metrics "$chart_package" "${common_args[@]}" \
+  --set-string controller.metrics.interval=2m \
+  --set-string kubernetesMetrics.interval=45s \
+  >"$tmp_dir/explicit-new-metrics.yaml"
+grep -q 'k8s-metrics-interval: "45s"' "$tmp_dir/explicit-new-metrics.yaml"
+
+helm template legacy-disabled "$chart_package" "${common_args[@]}" \
+  --set kubeStateMetrics.enabled=false \
+  --set controller.metrics.enabled=false \
+  >"$tmp_dir/legacy-disabled.yaml"
+! grep -q '# Source: ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/legacy-disabled.yaml"
+
+helm template legacy-app-discovery "$chart_package" "${common_args[@]}" \
+  --set kubeStateMetrics.enabled=false \
+  --set controller.metrics.appDiscovery.enabled=true \
+  >"$tmp_dir/legacy-app-discovery.yaml"
+extract_source 'ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/legacy-app-discovery.yaml" "$tmp_dir/legacy-app-scraper.yaml"
+grep -q 'k8s-metrics-endpoint: ""' "$tmp_dir/legacy-app-discovery.yaml"
+grep -q 'k8s-app-metrics-discovery: "true"' "$tmp_dir/legacy-app-discovery.yaml"
+grep -q 'automountServiceAccountToken: true' "$tmp_dir/legacy-app-scraper.yaml"
+grep -q 'ongrid-edge-metrics-scraper-discovery' "$tmp_dir/legacy-app-discovery.yaml"
+
+# A Scraper-only tuning change must restart the Scraper without needlessly
+# recycling the cluster-wide Controller or every node Agent.
+helm template metrics-config-change "$chart_package" "${common_args[@]}" \
+  --set-string kubernetesMetrics.endpoint=http://metrics.monitoring.svc:9090/metrics \
+  >"$tmp_dir/metrics-config-change.yaml"
+extract_source 'ongrid-edge/templates/deployment.yaml' "$tmp_dir/metrics-config-change.yaml" "$tmp_dir/metrics-config-controller.yaml"
+extract_source 'ongrid-edge/templates/daemonset.yaml' "$tmp_dir/metrics-config-change.yaml" "$tmp_dir/metrics-config-node.yaml"
+extract_source 'ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/metrics-config-change.yaml" "$tmp_dir/metrics-config-scraper.yaml"
+test "$(awk '/checksum\/config:/ {print $2}' "$tmp_dir/default-controller.yaml")" = "$(awk '/checksum\/config:/ {print $2}' "$tmp_dir/metrics-config-controller.yaml")"
+test "$(awk '/checksum\/config:/ {print $2}' "$tmp_dir/default-node.yaml")" = "$(awk '/checksum\/config:/ {print $2}' "$tmp_dir/metrics-config-node.yaml")"
+test "$(awk '/checksum\/config:/ {print $2}' "$tmp_dir/default-scraper.yaml")" != "$(awk '/checksum\/config:/ {print $2}' "$tmp_dir/metrics-config-scraper.yaml")"
 
 helm template upgrade "$chart_package" "${common_args[@]}" --is-upgrade >"$tmp_dir/upgrade.yaml"
 grep -q '# Source: ongrid-edge/templates/upgrade-preflight.yaml' "$tmp_dir/upgrade.yaml"

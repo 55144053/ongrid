@@ -3,14 +3,15 @@
 {{- if and $enabled (eq $mode "scraper") }}
 {{- $metrics := default dict .Values.kubernetesMetrics -}}
 {{- $endpoint := include "ongrid-edge.kubernetesMetricsEndpoint" . -}}
+{{- $appDiscoveryEnabled := eq (include "ongrid-edge.kubernetesAppMetricsDiscoveryEnabled" .) "true" -}}
 {{- if ne (int (default 1 $metrics.replicas)) 1 -}}
 {{- fail "kubernetesMetrics.replicas must be 1 until scraper leader election or target sharding is implemented" -}}
 {{- end -}}
 {{- if or (lt (int (default 3 $metrics.maxRetries)) 1) (gt (int (default 3 $metrics.maxRetries)) 10) -}}
 {{- fail "kubernetesMetrics.maxRetries must be between 1 and 10" -}}
 {{- end -}}
-{{- if not $endpoint -}}
-{{- fail "kubernetesMetrics.mode=scraper requires kubernetesMetrics.endpoint or kubeStateMetrics.enabled=true" -}}
+{{- if and (not $endpoint) (not $appDiscoveryEnabled) -}}
+{{- fail "kubernetesMetrics.mode=scraper requires an endpoint, kubeStateMetrics, or app discovery" -}}
 {{- end -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -31,12 +32,14 @@ spec:
       app.kubernetes.io/component: metrics-scraper
   template:
     metadata:
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
       labels:
         {{- include "ongrid-edge.labels" . | nindent 8 }}
         app.kubernetes.io/component: metrics-scraper
     spec:
       serviceAccountName: {{ include "ongrid-edge.metricsScraperServiceAccount" . }}
-      automountServiceAccountToken: false
+      automountServiceAccountToken: {{ $appDiscoveryEnabled }}
       terminationGracePeriodSeconds: 30
       {{- with .Values.image.architecture }}
       nodeSelector:
@@ -106,6 +109,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "ongrid-edge.fullname" . }}-config
                   key: k8s-metrics-retry-backoff
+            - name: ONGRID_K8S_APP_METRICS_DISCOVERY
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "ongrid-edge.fullname" . }}-config
+                  key: k8s-app-metrics-discovery
           readinessProbe:
             httpGet:
               path: /readyz

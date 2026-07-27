@@ -32,6 +32,13 @@ func TestRefreshTelemetryConfigUsesAuthenticatedControllerIdentity(t *testing.T)
 		ClusterID:           7,
 		AccessKey:           "kt_access",
 		SecretKey:           "ks_secret",
+		TracesEndpoint:      "https://tempo.example/v1/traces",
+		TracesAuthMode:      "backend",
+		TracesBasicUser:     "tempo-user",
+		TracesBasicPass:     "tempo-pass",
+		TracesTLSInsecure:   true,
+		LogsEndpoint:        "https://loki.example/loki/api/v1/push",
+		LogsAuthMode:        "backend",
 		RemoteWriteEndpoint: "https://manager.example/prometheus/api/v1/write",
 	}}
 	h := NewHandler(svc)
@@ -57,6 +64,11 @@ func TestRefreshTelemetryConfigUsesAuthenticatedControllerIdentity(t *testing.T)
 	}
 	if got.ClusterID != 7 || got.AccessKey != "kt_access" || got.SecretKey != "ks_secret" {
 		t.Fatalf("response = %#v", got)
+	}
+	if got.TracesEndpoint != "https://tempo.example/v1/traces" || got.TracesAuthMode != "backend" ||
+		got.TracesBasicUser != "tempo-user" || got.TracesBasicPass != "tempo-pass" || !got.TracesTLSInsecure ||
+		got.LogsEndpoint != "https://loki.example/loki/api/v1/push" || got.LogsAuthMode != "backend" {
+		t.Fatalf("signal target response = %#v", got)
 	}
 }
 

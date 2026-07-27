@@ -450,9 +450,43 @@ func TestUsecaseControllerEnrollmentIssuesSeparateTelemetryCredential(t *testing
 	if out.Telemetry.RemoteWriteBasicUser != out.Telemetry.AccessKey || out.Telemetry.RemoteWriteBasicPass != out.Telemetry.SecretKey {
 		t.Fatal("manager proxy must use the telemetry credential")
 	}
+	if out.Telemetry.TracesAuthMode != telemetryAuthModeTelemetry || out.Telemetry.LogsAuthMode != telemetryAuthModeTelemetry {
+		t.Fatalf("manager signal auth modes = traces:%q logs:%q", out.Telemetry.TracesAuthMode, out.Telemetry.LogsAuthMode)
+	}
 	if repo.telemetryCredential == nil || repo.telemetryCredential.SecretKeyHash == out.Telemetry.SecretKey ||
 		!passwd.Verify(out.Telemetry.SecretKey, repo.telemetryCredential.SecretKeyHash) {
 		t.Fatal("telemetry secret must be persisted only as a verifiable hash")
+	}
+}
+
+func TestResolveTelemetryConfigPublishesIndependentExternalTraceAndLogTargets(t *testing.T) {
+	uc := NewUsecase(nil, nil, Config{PublicURL: "https://manager.example"})
+	uc.SetTelemetryTargetResolver(staticTelemetryTargetResolver{targets: map[string]TelemetryTarget{
+		TelemetrySignalTraces: {
+			Endpoint:      "https://tempo.example/v1/traces",
+			BasicUser:     "tempo-user",
+			BasicPassword: "tempo-pass",
+			TLSInsecure:   true,
+		},
+		TelemetrySignalLogs: {
+			Endpoint: "https://loki.example/loki/api/v1/push",
+		},
+	}})
+
+	out, err := uc.resolveTelemetryConfig(context.Background(), 7, "kt_access", "ks_secret")
+	if err != nil {
+		t.Fatalf("resolveTelemetryConfig() error = %v", err)
+	}
+	if out.TracesEndpoint != "https://tempo.example/v1/traces" || out.TracesAuthMode != telemetryAuthModeBackend ||
+		out.TracesBasicUser != "tempo-user" || out.TracesBasicPass != "tempo-pass" || !out.TracesTLSInsecure {
+		t.Fatalf("trace target = %#v", out)
+	}
+	if out.LogsEndpoint != "https://loki.example/loki/api/v1/push" || out.LogsAuthMode != telemetryAuthModeBackend ||
+		out.LogsBasicUser != "" || out.LogsBasicPass != "" || out.LogsTLSInsecure {
+		t.Fatalf("log target = %#v", out)
+	}
+	if out.RemoteWriteBasicUser != "kt_access" || out.RemoteWriteBasicPass != "ks_secret" {
+		t.Fatalf("manager remote_write credential changed: %#v", out)
 	}
 }
 
@@ -556,6 +590,15 @@ func TestUsecaseRefreshTelemetryConfigPreservesValidCredential(t *testing.T) {
 type staticRemoteWriteResolver struct {
 	target RemoteWriteTarget
 	err    error
+}
+
+type staticTelemetryTargetResolver struct {
+	targets map[string]TelemetryTarget
+	err     error
+}
+
+func (r staticTelemetryTargetResolver) ResolveTelemetryTarget(_ context.Context, signal string) (TelemetryTarget, error) {
+	return r.targets[signal], r.err
 }
 
 func (r staticRemoteWriteResolver) ResolveRemoteWrite(context.Context) (RemoteWriteTarget, error) {

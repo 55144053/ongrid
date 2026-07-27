@@ -706,7 +706,15 @@ type telemetryConfigResponse struct {
 	AccessKey              string `json:"access_key"`
 	SecretKey              string `json:"secret_key"`
 	TracesEndpoint         string `json:"traces_endpoint,omitempty"`
+	TracesAuthMode         string `json:"traces_auth_mode,omitempty"`
+	TracesBasicUser        string `json:"traces_basic_user,omitempty"`
+	TracesBasicPass        string `json:"traces_basic_pass,omitempty"`
+	TracesTLSInsecure      bool   `json:"traces_tls_insecure,omitempty"`
 	LogsEndpoint           string `json:"logs_endpoint,omitempty"`
+	LogsAuthMode           string `json:"logs_auth_mode,omitempty"`
+	LogsBasicUser          string `json:"logs_basic_user,omitempty"`
+	LogsBasicPass          string `json:"logs_basic_pass,omitempty"`
+	LogsTLSInsecure        bool   `json:"logs_tls_insecure,omitempty"`
 	RemoteWriteEndpoint    string `json:"remote_write_endpoint,omitempty"`
 	RemoteWriteBearer      string `json:"remote_write_bearer,omitempty"`
 	RemoteWriteBasicUser   string `json:"remote_write_basic_user,omitempty"`
@@ -724,7 +732,15 @@ func telemetryConfigDTO(in *biz.TelemetryConfig) *telemetryConfigResponse {
 		AccessKey:              in.AccessKey,
 		SecretKey:              in.SecretKey,
 		TracesEndpoint:         in.TracesEndpoint,
+		TracesAuthMode:         in.TracesAuthMode,
+		TracesBasicUser:        in.TracesBasicUser,
+		TracesBasicPass:        in.TracesBasicPass,
+		TracesTLSInsecure:      in.TracesTLSInsecure,
 		LogsEndpoint:           in.LogsEndpoint,
+		LogsAuthMode:           in.LogsAuthMode,
+		LogsBasicUser:          in.LogsBasicUser,
+		LogsBasicPass:          in.LogsBasicPass,
+		LogsTLSInsecure:        in.LogsTLSInsecure,
 		RemoteWriteEndpoint:    in.RemoteWriteEndpoint,
 		RemoteWriteBearer:      in.RemoteWriteBearer,
 		RemoteWriteBasicUser:   in.RemoteWriteBasicUser,

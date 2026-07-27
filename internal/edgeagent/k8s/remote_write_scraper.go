@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,6 +31,7 @@ type RemoteWriteWriter interface {
 type RemoteWriteScraperConfig struct {
 	ClusterID        uint64
 	Endpoint         string
+	DiscoverApps     bool
 	Interval         time.Duration
 	Timeout          time.Duration
 	PushTimeout      time.Duration
@@ -40,17 +42,24 @@ type RemoteWriteScraperConfig struct {
 	RetryBackoff     time.Duration
 }
 
-// RemoteWriteScraper is the single-active KSM data plane. It has no tunnel
-// client and no Kubernetes API client; its only inputs are a fixed /metrics
-// URL and an exact remote_write writer.
+// RemoteWriteScraper is the single-active Kubernetes metrics data plane. It
+// has no tunnel client. It scrapes the configured kube-state-metrics endpoint
+// and, when enabled, annotation-discovered application targets through a
+// read-only Kubernetes API client before writing directly to remote_write.
 type RemoteWriteScraper struct {
 	writer  RemoteWriteWriter
 	cfg     RemoteWriteScraperConfig
 	log     *slog.Logger
+	api     *apiClient
 	metrics *metricsObserver
+	ready   atomic.Bool
 }
 
 func NewRemoteWriteScraper(writer RemoteWriteWriter, cfg RemoteWriteScraperConfig, log *slog.Logger, registerer prometheus.Registerer) (*RemoteWriteScraper, error) {
+	return newRemoteWriteScraper(writer, cfg, log, registerer, nil)
+}
+
+func newRemoteWriteScraper(writer RemoteWriteWriter, cfg RemoteWriteScraperConfig, log *slog.Logger, registerer prometheus.Registerer, api *apiClient) (*RemoteWriteScraper, error) {
 	if writer == nil {
 		return nil, errors.New("k8s remote write scraper: writer is required")
 	}
@@ -58,11 +67,13 @@ func NewRemoteWriteScraper(writer RemoteWriteWriter, cfg RemoteWriteScraperConfi
 		return nil, errors.New("k8s remote write scraper: cluster_id is required")
 	}
 	cfg.Endpoint = strings.TrimSpace(cfg.Endpoint)
-	if cfg.Endpoint == "" {
-		return nil, errors.New("k8s remote write scraper: endpoint is required")
+	if cfg.Endpoint == "" && !cfg.DiscoverApps {
+		return nil, errors.New("k8s remote write scraper: endpoint or app discovery is required")
 	}
-	if err := metricscommon.ValidateURL(cfg.Endpoint); err != nil {
-		return nil, fmt.Errorf("k8s remote write scraper endpoint: %w", err)
+	if cfg.Endpoint != "" {
+		if err := metricscommon.ValidateURL(cfg.Endpoint); err != nil {
+			return nil, fmt.Errorf("k8s remote write scraper endpoint: %w", err)
+		}
 	}
 	if cfg.Interval <= 0 {
 		cfg.Interval = defaultK8sMetricsInterval
@@ -97,11 +108,26 @@ func NewRemoteWriteScraper(writer RemoteWriteWriter, cfg RemoteWriteScraperConfi
 	if log == nil {
 		log = slog.Default()
 	}
+	if cfg.DiscoverApps && api == nil {
+		var err error
+		api, err = newInClusterAPIClient()
+		if err != nil {
+			return nil, fmt.Errorf("k8s remote write scraper app discovery: %w", err)
+		}
+	}
 	observer, err := newMetricsObserver(registerer)
 	if err != nil {
 		return nil, err
 	}
-	return &RemoteWriteScraper{writer: writer, cfg: cfg, log: log, metrics: observer}, nil
+	return &RemoteWriteScraper{writer: writer, cfg: cfg, log: log, api: api, metrics: observer}, nil
+}
+
+// Ready reports whether the most recent required discovery, core scrape, and
+// remote_write cycle succeeded. Individual application endpoints report their
+// own up=0 series and do not take a healthy kube-state-metrics scraper offline.
+// It remains false until the first required cycle.
+func (s *RemoteWriteScraper) Ready() bool {
+	return s != nil && s.ready.Load()
 }
 
 func (s *RemoteWriteScraper) Run(ctx context.Context) error {
@@ -121,15 +147,98 @@ func (s *RemoteWriteScraper) Run(ctx context.Context) error {
 	}
 }
 
-func (s *RemoteWriteScraper) scrapeAndWrite(ctx context.Context) {
+func (s *RemoteWriteScraper) scrapeAndWrite(ctx context.Context) bool {
+	targets, discoveryOK := s.targets(ctx)
+	cycleOK := discoveryOK
+	hasCoreTarget := s.cfg.Endpoint != ""
+	for _, target := range targets {
+		success := s.scrapeTargetAndWrite(ctx, target)
+		isAppTarget := target.SourceLabel == k8sAppMetricsSource
+		if !success && (!hasCoreTarget || !isAppTarget) {
+			cycleOK = false
+		}
+		if hasCoreTarget && !isAppTarget {
+			// Application targets may be numerous or temporarily unavailable.
+			// Publish core readiness as soon as KSM and remote_write complete.
+			s.ready.Store(cycleOK)
+		}
+	}
+	// App-discovery-only configurations may legitimately have no annotated
+	// pods. Publish one bounded status sample so readiness still proves that
+	// both Kubernetes discovery and remote_write are usable.
+	if len(targets) == 0 && s.cfg.DiscoverApps && discoveryOK {
+		target := metricscommon.Target{
+			ID:          "app-discovery",
+			Name:        "app-discovery",
+			Enabled:     true,
+			SourceLabel: k8sAppMetricsSource,
+			Kind:        "kubernetes-app-discovery",
+		}
+		status := []tunnel.PromSample{metricscommon.ScrapeUpSample(time.Now(), "k8s_app", target, true)}
+		if err := s.writeWithRetry(ctx, k8sAppMetricsSource, status); err != nil {
+			s.log.Warn("k8s app metrics discovery status write failed", slog.Any("err", err))
+			cycleOK = false
+		}
+	}
+	if !hasCoreTarget {
+		s.ready.Store(cycleOK)
+	}
+	return cycleOK
+}
+
+func (s *RemoteWriteScraper) targets(ctx context.Context) ([]metricscommon.Target, bool) {
+	targets := make([]metricscommon.Target, 0, 1)
+	if s.cfg.Endpoint != "" {
+		targets = append(targets, s.target())
+	}
+	if !s.cfg.DiscoverApps {
+		return targets, true
+	}
+	if s.api == nil {
+		s.log.Warn("k8s app metrics discovery client is unavailable")
+		return targets, false
+	}
+	discoveryCtx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
+	pods, err := s.api.listMetricPods(discoveryCtx, "")
+	cancel()
+	if err != nil {
+		s.log.Warn("k8s app metrics discovery failed", slog.Any("err", err))
+		return targets, false
+	}
+	appCfg := MetricsConfig{
+		Interval:    s.cfg.Interval,
+		Timeout:     s.cfg.Timeout,
+		SampleLimit: s.cfg.SampleLimit,
+	}
+	discovered := 0
+	for _, pod := range pods {
+		target, ok := appMetricsTarget(pod, appCfg)
+		if !ok {
+			continue
+		}
+		targets = append(targets, target)
+		discovered++
+	}
+	s.log.Debug("k8s app metrics discovery completed", slog.Int("targets", discovered))
+	return targets, true
+}
+
+func (s *RemoteWriteScraper) scrapeTargetAndWrite(ctx context.Context, target metricscommon.Target) bool {
 	startedAt := time.Now()
-	target := s.target()
-	batcher, err := newMetricsBatcher(0, k8sMetricsSource, s.cfg.BatchSampleLimit, s.cfg.BatchByteLimit, func(samples []tunnel.PromSample) error {
-		return s.writeWithRetry(ctx, k8sMetricsSource, samples)
+	source := strings.TrimSpace(target.SourceLabel)
+	if source == "" {
+		source = k8sMetricsSource
+	}
+	plugin := "k8s"
+	if source == k8sAppMetricsSource {
+		plugin = "k8s_app"
+	}
+	batcher, err := newMetricsBatcher(0, source, s.cfg.BatchSampleLimit, s.cfg.BatchByteLimit, func(samples []tunnel.PromSample) error {
+		return s.writeWithRetry(ctx, source, samples)
 	})
 	if err != nil {
 		s.log.Error("k8s metrics batcher initialization failed", slog.Any("err", err))
-		return
+		return false
 	}
 
 	scrapeCtx, cancel := context.WithTimeout(ctx, s.cfg.Timeout)
@@ -140,16 +249,16 @@ func (s *RemoteWriteScraper) scrapeAndWrite(ctx context.Context) {
 	cancel()
 	batcher.Flush()
 	dataStats := batcher.Stats()
-	s.metrics.observeScrape(k8sMetricsSource, stats.Accepted, stats.LimitExceeded)
-	s.metrics.observePush(k8sMetricsSource, dataStats)
+	s.metrics.observeScrape(source, stats.Accepted, stats.LimitExceeded)
+	s.metrics.observePush(source, dataStats)
 
 	partial := stats.LimitExceeded || dataStats.FailedBatches > 0 || dataStats.RejectedSamples > 0
 	if scrapeErr != nil && stats.Accepted > 0 {
 		partial = true
 	}
-	statusSamples := scrapeStatusSamples(time.Now(), "k8s", target, partial, dataStats.SuccessfulSamples, scrapeErr == nil)
+	statusSamples := scrapeStatusSamples(time.Now(), plugin, target, partial, dataStats.SuccessfulSamples, scrapeErr == nil)
 	statusStats := metricsBatchStats{}
-	if err := s.writeWithRetry(ctx, k8sMetricsSource, statusSamples); err != nil {
+	if err := s.writeWithRetry(ctx, source, statusSamples); err != nil {
 		statusStats.FailedBatches = 1
 		statusStats.FailedSamples = len(statusSamples)
 		statusStats.FirstError = err
@@ -157,12 +266,12 @@ func (s *RemoteWriteScraper) scrapeAndWrite(ctx context.Context) {
 		statusStats.SuccessfulBatches = 1
 		statusStats.SuccessfulSamples = len(statusSamples)
 	}
-	s.metrics.observePush(k8sMetricsSource, statusStats)
+	s.metrics.observePush(source, statusStats)
 	completedAt := time.Now()
-	s.metrics.observeCycle(k8sMetricsSource, startedAt, completedAt,
-		scrapeErr == nil && !stats.LimitExceeded && dataStats.FailedBatches == 0 && dataStats.RejectedSamples == 0 && statusStats.FailedBatches == 0,
-	)
+	success := scrapeErr == nil && !stats.LimitExceeded && dataStats.FailedBatches == 0 && dataStats.RejectedSamples == 0 && statusStats.FailedBatches == 0
+	s.metrics.observeCycle(source, startedAt, completedAt, success)
 	s.logOutcome(target, stats, dataStats, statusStats, scrapeErr)
+	return success
 }
 
 func (s *RemoteWriteScraper) writeWithRetry(ctx context.Context, source string, samples []tunnel.PromSample) error {

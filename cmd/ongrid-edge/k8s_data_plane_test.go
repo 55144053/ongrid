@@ -123,6 +123,47 @@ func TestTelemetryRemoteWriteWriterReloadsProjectedConfig(t *testing.T) {
 	}
 }
 
+func TestK8sTelemetryGatewayFetcherUsesIndependentBackendAuth(t *testing.T) {
+	dir := t.TempDir()
+	files := map[string]string{
+		"telemetry-cluster-id":                "7",
+		"telemetry-access-key":                "kt_access",
+		"telemetry-secret-key":                "ks_secret",
+		"telemetry-traces-endpoint":           "https://tempo.example/v1/traces",
+		"telemetry-traces-auth-mode":          telemetrySignalAuthBackend,
+		"telemetry-traces-basic-user":         "tempo-user",
+		"telemetry-traces-basic-pass":         "tempo-pass",
+		"telemetry-traces-tls-insecure":       "true",
+		"telemetry-logs-endpoint":             "https://loki.example/loki/api/v1/push",
+		"telemetry-logs-auth-mode":            telemetrySignalAuthBackend,
+		"telemetry-logs-tls-insecure":         "false",
+		"telemetry-remote-write-endpoint":     "https://metrics.example/api/v1/write",
+		"telemetry-remote-write-basic-user":   "metrics-user",
+		"telemetry-remote-write-basic-pass":   "metrics-pass",
+		"telemetry-remote-write-tls-insecure": "false",
+	}
+	for name, value := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(value), 0600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+
+	configs, err := (&k8sTelemetryGatewayFetcher{dir: dir}).Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("Fetch() error = %v", err)
+	}
+	cfg := configs[edgeplugintraces.Name]
+	if cfg.AuthUser != "tempo-user" || cfg.AuthPass != "tempo-pass" {
+		t.Fatalf("trace auth = %q/%q", cfg.AuthUser, cfg.AuthPass)
+	}
+	if cfg.Spec["logs_auth_override"] != true || cfg.Spec["logs_auth_user"] != "" || cfg.Spec["logs_auth_pass"] != "" {
+		t.Fatalf("log auth spec = %#v", cfg.Spec)
+	}
+	if cfg.Spec["tls_insecure_skip_verify"] != true || cfg.Spec["logs_tls_insecure_skip_verify"] != false {
+		t.Fatalf("signal TLS spec = %#v", cfg.Spec)
+	}
+}
+
 func TestReadTelemetryFilesRejectsMissingWriteEndpoint(t *testing.T) {
 	dir := t.TempDir()
 	for name, value := range map[string]string{

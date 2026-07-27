@@ -108,7 +108,12 @@ func TestTelemetrySecretDataContainsOnlyPublishedDataPlaneFields(t *testing.T) {
 		AccessKey:              "kt_access",
 		SecretKey:              "ks_secret",
 		TracesEndpoint:         "https://manager.example/v1/traces",
+		TracesAuthMode:         telemetrySignalAuthTelemetry,
+		TracesTLSInsecure:      true,
 		LogsEndpoint:           "https://manager.example/loki/api/v1/push",
+		LogsAuthMode:           telemetrySignalAuthBackend,
+		LogsBasicUser:          "loki-user",
+		LogsBasicPass:          "loki-pass",
 		RemoteWriteEndpoint:    "https://manager.example/prometheus/api/v1/write",
 		RemoteWriteBasicUser:   "kt_access",
 		RemoteWriteBasicPass:   "ks_secret",
@@ -121,7 +126,12 @@ func TestTelemetrySecretDataContainsOnlyPublishedDataPlaneFields(t *testing.T) {
 		"telemetry-access-key":                "kt_access",
 		"telemetry-secret-key":                "ks_secret",
 		"telemetry-traces-endpoint":           "https://manager.example/v1/traces",
+		"telemetry-traces-auth-mode":          telemetrySignalAuthTelemetry,
+		"telemetry-traces-tls-insecure":       "true",
 		"telemetry-logs-endpoint":             "https://manager.example/loki/api/v1/push",
+		"telemetry-logs-auth-mode":            telemetrySignalAuthBackend,
+		"telemetry-logs-basic-user":           "loki-user",
+		"telemetry-logs-basic-pass":           "loki-pass",
 		"telemetry-remote-write-endpoint":     "https://manager.example/prometheus/api/v1/write",
 		"telemetry-remote-write-basic-user":   "kt_access",
 		"telemetry-remote-write-basic-pass":   "ks_secret",
@@ -140,16 +150,24 @@ func TestTelemetrySecretDataContainsOnlyPublishedDataPlaneFields(t *testing.T) {
 
 func TestApplyManagerTelemetryTLSIsOriginScoped(t *testing.T) {
 	t.Setenv("ONGRID_K8S_ENROLL_TLS_INSECURE", "true")
-	managerTarget := k8sTelemetryConfig{RemoteWriteEndpoint: "https://manager.example/prometheus/api/v1/write"}
+	managerTarget := k8sTelemetryConfig{
+		TracesEndpoint:      "https://manager.example/v1/traces",
+		LogsEndpoint:        "https://manager.example/loki/api/v1/push",
+		RemoteWriteEndpoint: "https://manager.example/prometheus/api/v1/write",
+	}
 	applyManagerTelemetryTLS(&managerTarget, "https://manager.example")
-	if !managerTarget.RemoteWriteTLSInsecure {
-		t.Fatal("manager-origin remote_write did not inherit the explicit manager TLS setting")
+	if !managerTarget.TracesTLSInsecure || !managerTarget.LogsTLSInsecure || !managerTarget.RemoteWriteTLSInsecure {
+		t.Fatalf("manager-origin signals did not inherit the explicit manager TLS setting: %#v", managerTarget)
 	}
 
-	externalTarget := k8sTelemetryConfig{RemoteWriteEndpoint: "https://metrics.example/api/v1/write"}
+	externalTarget := k8sTelemetryConfig{
+		TracesEndpoint:      "https://tempo.example/v1/traces",
+		LogsEndpoint:        "https://loki.example/loki/api/v1/push",
+		RemoteWriteEndpoint: "https://metrics.example/api/v1/write",
+	}
 	applyManagerTelemetryTLS(&externalTarget, "https://manager.example")
-	if externalTarget.RemoteWriteTLSInsecure {
-		t.Fatal("external remote_write must not inherit the manager TLS setting")
+	if externalTarget.TracesTLSInsecure || externalTarget.LogsTLSInsecure || externalTarget.RemoteWriteTLSInsecure {
+		t.Fatalf("external signals inherited the manager TLS setting: %#v", externalTarget)
 	}
 }
 

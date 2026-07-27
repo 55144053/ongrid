@@ -30,6 +30,11 @@ import (
 
 const defaultK8sTelemetrySecretDir = "/var/run/ongrid-telemetry"
 
+const (
+	telemetrySignalAuthTelemetry = "telemetry"
+	telemetrySignalAuthBackend   = "backend"
+)
+
 func runK8sDataPlaneMode(ctx context.Context, mode string, log *slog.Logger) (bool, error) {
 	switch strings.TrimSpace(mode) {
 	case "k8s-telemetry-gateway":
@@ -101,6 +106,7 @@ func runK8sMetricsScraper(ctx context.Context, log *slog.Logger) error {
 	scraper, err := edgek8s.NewRemoteWriteScraper(writer, edgek8s.RemoteWriteScraperConfig{
 		ClusterID:        config.clusterID,
 		Endpoint:         strings.TrimSpace(os.Getenv("ONGRID_K8S_METRICS_ENDPOINT")),
+		DiscoverApps:     parseBoolEnv("ONGRID_K8S_APP_METRICS_DISCOVERY", false),
 		Interval:         parseDurationEnv("ONGRID_K8S_METRICS_INTERVAL", 30*time.Second),
 		Timeout:          parseDurationEnv("ONGRID_K8S_METRICS_TIMEOUT", 15*time.Second),
 		PushTimeout:      pushTimeout,
@@ -116,7 +122,7 @@ func runK8sMetricsScraper(ctx context.Context, log *slog.Logger) error {
 
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error { return scraper.Run(groupCtx) })
-	group.Go(func() error { return runDataPlaneDiagnostics(groupCtx, registry, func() bool { return true }, log) })
+	group.Go(func() error { return runDataPlaneDiagnostics(groupCtx, registry, scraper.Ready, log) })
 	log.Info("kubernetes metrics scraper mode started; tunnel and inventory are disabled",
 		slog.Uint64("cluster_id", config.clusterID),
 	)
@@ -166,6 +172,10 @@ func (f *k8sTelemetryGatewayFetcher) Fetch(ctx context.Context) (map[string]edge
 		"enable_logs":                       true,
 		"enable_metrics":                    true,
 		"logs_endpoint":                     files.logsEndpoint,
+		"logs_auth_override":                true,
+		"logs_auth_user":                    files.logsAuthUser,
+		"logs_auth_pass":                    files.logsAuthPass,
+		"logs_tls_insecure_skip_verify":     files.logsTLSInsecure,
 		"metrics_remote_write_endpoint":     files.remoteWriteEndpoint,
 		"metrics_remote_write_auth_user":    files.remoteWriteBasicUser,
 		"metrics_remote_write_auth_pass":    files.remoteWriteBasicPass,
@@ -178,7 +188,7 @@ func (f *k8sTelemetryGatewayFetcher) Fetch(ctx context.Context) (map[string]edge
 		"batch_max_size":                    parseIntEnv("ONGRID_K8S_GATEWAY_BATCH_MAX_SIZE", 4096),
 		"queue_size":                        parseIntEnv("ONGRID_K8S_GATEWAY_QUEUE_SIZE", 512),
 		"collector_metrics_endpoint":        "0.0.0.0:8888",
-		"tls_insecure_skip_verify":          parseBoolEnv("ONGRID_K8S_ENROLL_TLS_INSECURE", false),
+		"tls_insecure_skip_verify":          files.tracesTLSInsecure,
 		"extra_attrs": map[string]interface{}{
 			"cluster_id":        strconv.FormatUint(files.clusterID, 10),
 			"telemetry_gateway": "kubernetes",
@@ -193,8 +203,8 @@ func (f *k8sTelemetryGatewayFetcher) Fetch(ctx context.Context) (map[string]edge
 		edgeplugintraces.Name: {
 			Enabled:  true,
 			Endpoint: files.tracesEndpoint,
-			AuthUser: files.accessKey,
-			AuthPass: files.secretKey,
+			AuthUser: files.tracesAuthUser,
+			AuthPass: files.tracesAuthPass,
 			Spec:     spec,
 		},
 	}, nil
@@ -205,7 +215,13 @@ type telemetryFiles struct {
 	accessKey              string
 	secretKey              string
 	tracesEndpoint         string
+	tracesAuthUser         string
+	tracesAuthPass         string
+	tracesTLSInsecure      bool
 	logsEndpoint           string
+	logsAuthUser           string
+	logsAuthPass           string
+	logsTLSInsecure        bool
 	remoteWriteEndpoint    string
 	remoteWriteBearer      string
 	remoteWriteBasicUser   string
@@ -242,11 +258,74 @@ func readTelemetryFiles(ctx context.Context, dir string) (telemetryFiles, error)
 	if err := validateTelemetryEndpoint("logs", logsEndpoint); err != nil {
 		return telemetryFiles{}, err
 	}
+	tracesAuth, err := readTelemetrySignalAuth(ctx, dir, "traces", accessKey, secretKey)
+	if err != nil {
+		return telemetryFiles{}, err
+	}
+	logsAuth, err := readTelemetrySignalAuth(ctx, dir, "logs", accessKey, secretKey)
+	if err != nil {
+		return telemetryFiles{}, err
+	}
 	files.accessKey = accessKey
 	files.secretKey = secretKey
 	files.tracesEndpoint = tracesEndpoint
+	files.tracesAuthUser = tracesAuth.user
+	files.tracesAuthPass = tracesAuth.password
+	files.tracesTLSInsecure = tracesAuth.tlsInsecure
 	files.logsEndpoint = logsEndpoint
+	files.logsAuthUser = logsAuth.user
+	files.logsAuthPass = logsAuth.password
+	files.logsTLSInsecure = logsAuth.tlsInsecure
 	return files, nil
+}
+
+type telemetrySignalAuth struct {
+	user        string
+	password    string
+	tlsInsecure bool
+}
+
+func readTelemetrySignalAuth(ctx context.Context, dir, signal, accessKey, secretKey string) (telemetrySignalAuth, error) {
+	prefix := "telemetry-" + signal + "-"
+	mode, err := readTelemetryFile(ctx, dir, prefix+"auth-mode", false)
+	if err != nil {
+		return telemetrySignalAuth{}, err
+	}
+	// Secrets created before per-signal auth was introduced used the shared
+	// telemetry credential. Treat a missing mode as that legacy contract.
+	if mode == "" {
+		mode = telemetrySignalAuthTelemetry
+	}
+	user, err := readTelemetryFile(ctx, dir, prefix+"basic-user", false)
+	if err != nil {
+		return telemetrySignalAuth{}, err
+	}
+	password, err := readTelemetryFile(ctx, dir, prefix+"basic-pass", false)
+	if err != nil {
+		return telemetrySignalAuth{}, err
+	}
+	tlsRaw, err := readTelemetryFile(ctx, dir, prefix+"tls-insecure", false)
+	if err != nil {
+		return telemetrySignalAuth{}, err
+	}
+	tlsInsecure := parseBoolEnv("ONGRID_K8S_ENROLL_TLS_INSECURE", false)
+	if tlsRaw != "" {
+		tlsInsecure, err = strconv.ParseBool(tlsRaw)
+		if err != nil {
+			return telemetrySignalAuth{}, fmt.Errorf("parse kubernetes telemetry %s TLS setting: %w", signal, err)
+		}
+	}
+	switch mode {
+	case telemetrySignalAuthTelemetry:
+		return telemetrySignalAuth{user: accessKey, password: secretKey, tlsInsecure: tlsInsecure}, nil
+	case telemetrySignalAuthBackend:
+		if (user == "") != (password == "") {
+			return telemetrySignalAuth{}, fmt.Errorf("kubernetes telemetry %s basic auth requires both username and password", signal)
+		}
+		return telemetrySignalAuth{user: user, password: password, tlsInsecure: tlsInsecure}, nil
+	default:
+		return telemetrySignalAuth{}, fmt.Errorf("unsupported kubernetes telemetry %s auth mode %q", signal, mode)
+	}
 }
 
 // readRemoteWriteFiles is the intentionally narrow Metrics Scraper view of

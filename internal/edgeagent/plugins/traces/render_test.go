@@ -228,6 +228,44 @@ func TestRenderBasicWhenUserSet(t *testing.T) {
 	}
 }
 
+func TestRenderUsesIndependentTraceAndLogAuthAndTLS(t *testing.T) {
+	out, err := render(plugins.PluginConfig{
+		Enabled:  true,
+		EdgeID:   1,
+		Endpoint: "https://tempo.example/v1/traces",
+		AuthUser: "tempo-user",
+		AuthPass: "tempo-pass",
+		Spec: map[string]interface{}{
+			"enable_logs":                   true,
+			"logs_endpoint":                 "https://loki.example/loki/api/v1/push",
+			"logs_auth_override":            true,
+			"logs_auth_user":                "loki-user",
+			"logs_auth_pass":                "loki-pass",
+			"tls_insecure_skip_verify":      true,
+			"logs_tls_insecure_skip_verify": false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("render: %v", err)
+	}
+	body := string(out)
+	if !strings.Contains(body, "Authorization: \"Basic dGVtcG8tdXNlcjp0ZW1wby1wYXNz\"") ||
+		!strings.Contains(body, "Authorization: \"Basic bG9raS11c2VyOmxva2ktcGFzcw==\"") {
+		t.Fatalf("independent auth headers missing:\n%s", body)
+	}
+	start := strings.Index(body, "loki/manager:")
+	if start < 0 {
+		t.Fatalf("Loki exporter missing:\n%s", body)
+	}
+	end := strings.Index(body[start:], "default_labels_enabled:")
+	if end < 0 {
+		t.Fatalf("Loki exporter missing:\n%s", body)
+	}
+	if strings.Contains(body[start:start+end], "tls:") {
+		t.Fatalf("Loki inherited trace TLS policy:\n%s", body[start:start+end])
+	}
+}
+
 func TestRenderOmitDeviceIDForGateway(t *testing.T) {
 	cfg := plugins.PluginConfig{
 		Enabled:  true,

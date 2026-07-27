@@ -495,7 +495,15 @@ type k8sTelemetryConfig struct {
 	AccessKey              string `json:"access_key"`
 	SecretKey              string `json:"secret_key"`
 	TracesEndpoint         string `json:"traces_endpoint,omitempty"`
+	TracesAuthMode         string `json:"traces_auth_mode,omitempty"`
+	TracesBasicUser        string `json:"traces_basic_user,omitempty"`
+	TracesBasicPass        string `json:"traces_basic_pass,omitempty"`
+	TracesTLSInsecure      bool   `json:"traces_tls_insecure,omitempty"`
 	LogsEndpoint           string `json:"logs_endpoint,omitempty"`
+	LogsAuthMode           string `json:"logs_auth_mode,omitempty"`
+	LogsBasicUser          string `json:"logs_basic_user,omitempty"`
+	LogsBasicPass          string `json:"logs_basic_pass,omitempty"`
+	LogsTLSInsecure        bool   `json:"logs_tls_insecure,omitempty"`
 	RemoteWriteEndpoint    string `json:"remote_write_endpoint,omitempty"`
 	RemoteWriteBearer      string `json:"remote_write_bearer,omitempty"`
 	RemoteWriteBasicUser   string `json:"remote_write_basic_user,omitempty"`

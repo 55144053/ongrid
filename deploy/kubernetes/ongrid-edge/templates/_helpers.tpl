@@ -81,10 +81,27 @@ ongrid.io/telemetry-backend
 
 {{- define "ongrid-edge.kubernetesMetricsEnabled" -}}
 {{- $metrics := default dict .Values.kubernetesMetrics -}}
+{{- $controllerMetrics := default dict .Values.controller.metrics -}}
 {{- if kindIs "bool" $metrics.enabled -}}
 {{- if $metrics.enabled -}}true{{- else -}}false{{- end -}}
-{{- else -}}
+{{- else if or $metrics.endpoint (default false $controllerMetrics.enabled) (eq (include "ongrid-edge.kubeStateMetricsEnabled" .) "true") (eq (include "ongrid-edge.kubernetesAppMetricsDiscoveryEnabled" .) "true") -}}
 true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{- define "ongrid-edge.kubernetesAppMetricsDiscoveryEnabled" -}}
+{{- $metrics := default dict .Values.kubernetesMetrics -}}
+{{- $app := default dict $metrics.appDiscovery -}}
+{{- $controllerMetrics := default dict .Values.controller.metrics -}}
+{{- $legacyApp := default dict $controllerMetrics.appDiscovery -}}
+{{- if kindIs "bool" $app.enabled -}}
+{{- if $app.enabled -}}true{{- else -}}false{{- end -}}
+{{- else if kindIs "bool" $legacyApp.enabled -}}
+{{- if $legacyApp.enabled -}}true{{- else -}}false{{- end -}}
+{{- else -}}
+false
 {{- end -}}
 {{- end -}}
 
@@ -162,8 +179,11 @@ true
 
 {{- define "ongrid-edge.kubernetesMetricsEndpoint" -}}
 {{- $metrics := default dict .Values.kubernetesMetrics -}}
+{{- $controllerMetrics := default dict .Values.controller.metrics -}}
 {{- if $metrics.endpoint -}}
 {{- $metrics.endpoint -}}
+{{- else if $controllerMetrics.endpoint -}}
+{{- $controllerMetrics.endpoint -}}
 {{- else if eq (include "ongrid-edge.kubeStateMetricsEnabled" .) "true" -}}
 {{- include "ongrid-edge.kubeStateMetricsEndpoint" . -}}
 {{- end -}}
@@ -171,7 +191,7 @@ true
 
 {{- define "ongrid-edge.k8sMetricsEnabled" -}}
 {{- $controllerMetrics := default dict .Values.controller.metrics -}}
-{{- if and (eq (include "ongrid-edge.kubernetesMetricsEnabled" .) "true") (eq (include "ongrid-edge.kubernetesMetricsMode" .) "controller") (or (default false $controllerMetrics.enabled) (eq (include "ongrid-edge.kubeStateMetricsEnabled" .) "true")) -}}true{{- else -}}false{{- end -}}
+{{- if and (eq (include "ongrid-edge.kubernetesMetricsEnabled" .) "true") (eq (include "ongrid-edge.kubernetesMetricsMode" .) "controller") (or (default false $controllerMetrics.enabled) (eq (include "ongrid-edge.kubeStateMetricsEnabled" .) "true") (eq (include "ongrid-edge.kubernetesAppMetricsDiscoveryEnabled" .) "true")) -}}true{{- else -}}false{{- end -}}
 {{- end -}}
 
 {{- define "ongrid-edge.kubeStateMetricsResources" -}}

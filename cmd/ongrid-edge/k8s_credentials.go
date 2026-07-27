@@ -448,7 +448,15 @@ func telemetrySecretData(in k8sTelemetryConfig) map[string][]byte {
 		"telemetry-access-key":                []byte(in.AccessKey),
 		"telemetry-secret-key":                []byte(in.SecretKey),
 		"telemetry-traces-endpoint":           []byte(in.TracesEndpoint),
+		"telemetry-traces-auth-mode":          []byte(in.TracesAuthMode),
+		"telemetry-traces-basic-user":         []byte(in.TracesBasicUser),
+		"telemetry-traces-basic-pass":         []byte(in.TracesBasicPass),
+		"telemetry-traces-tls-insecure":       []byte(strconv.FormatBool(in.TracesTLSInsecure)),
 		"telemetry-logs-endpoint":             []byte(in.LogsEndpoint),
+		"telemetry-logs-auth-mode":            []byte(in.LogsAuthMode),
+		"telemetry-logs-basic-user":           []byte(in.LogsBasicUser),
+		"telemetry-logs-basic-pass":           []byte(in.LogsBasicPass),
+		"telemetry-logs-tls-insecure":         []byte(strconv.FormatBool(in.LogsTLSInsecure)),
 		"telemetry-remote-write-endpoint":     []byte(in.RemoteWriteEndpoint),
 		"telemetry-remote-write-bearer":       []byte(in.RemoteWriteBearer),
 		"telemetry-remote-write-basic-user":   []byte(in.RemoteWriteBasicUser),
@@ -469,18 +477,27 @@ func dataContainsValues(current, desired map[string][]byte) bool {
 }
 
 // applyManagerTelemetryTLS carries the controller's explicit trust choice to
-// remote_write only when that endpoint is served by the same Manager origin.
-// An external backend keeps the TLS policy resolved by Manager.
+// Manager-origin signals only. External backends keep the TLS policy resolved
+// by Manager from their integration settings.
 func applyManagerTelemetryTLS(in *k8sTelemetryConfig, managerURL string) {
 	if in == nil || !parseBoolEnv("ONGRID_K8S_ENROLL_TLS_INSECURE", false) {
 		return
 	}
 	manager, managerErr := url.Parse(strings.TrimSpace(managerURL))
-	target, targetErr := url.Parse(strings.TrimSpace(in.RemoteWriteEndpoint))
-	if managerErr != nil || targetErr != nil || manager.Scheme == "" || manager.Host == "" {
+	if managerErr != nil || manager.Scheme == "" || manager.Host == "" {
 		return
 	}
-	if strings.EqualFold(manager.Scheme, target.Scheme) && strings.EqualFold(manager.Host, target.Host) {
+	sameOrigin := func(raw string) bool {
+		target, err := url.Parse(strings.TrimSpace(raw))
+		return err == nil && strings.EqualFold(manager.Scheme, target.Scheme) && strings.EqualFold(manager.Host, target.Host)
+	}
+	if sameOrigin(in.TracesEndpoint) {
+		in.TracesTLSInsecure = true
+	}
+	if sameOrigin(in.LogsEndpoint) {
+		in.LogsTLSInsecure = true
+	}
+	if sameOrigin(in.RemoteWriteEndpoint) {
 		in.RemoteWriteTLSInsecure = true
 	}
 }
