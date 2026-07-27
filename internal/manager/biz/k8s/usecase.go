@@ -2111,7 +2111,7 @@ func (u *Usecase) UpgradeCommand(cluster *model.Cluster) string {
 	}
 	args = append(args,
 		"--namespace "+shellQuote(namespace),
-		"--reuse-values",
+		"--reset-then-reuse-values",
 		"--set-string manager.publicURL="+shellQuote(publicURL),
 		"--set-string manager.tunnelAddr="+shellQuote(tunnelAddr),
 		"--set-string manager.tlsInsecure=true",
@@ -2119,6 +2119,12 @@ func (u *Usecase) UpgradeCommand(cluster *model.Cluster) string {
 	if imageTag := strings.TrimSpace(u.cfg.ImageTag); imageTag != "" {
 		args = append(args, "--set-string image.tag="+shellQuote(imageTag))
 	}
+	args = append(args,
+		"--wait",
+		"--wait-for-jobs",
+		"--atomic",
+		"--timeout "+shellQuote("15m"),
+	)
 	return strings.Join(args, " ")
 }
 

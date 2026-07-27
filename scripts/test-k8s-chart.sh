@@ -42,11 +42,19 @@ helm lint "$chart_dir" "${common_args[@]}"
 
 helm template ongrid-edge "$chart_package" "${common_args[@]}" >"$tmp_dir/default.yaml"
 extract_source 'ongrid-edge/templates/telemetry-credentials-secret.yaml' "$tmp_dir/default.yaml" "$tmp_dir/telemetry-secret.yaml"
+extract_source 'ongrid-edge/templates/deployment.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-controller.yaml"
+extract_source 'ongrid-edge/templates/telemetry-gateway-service.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-gateway-service.yaml"
 grep -q 'type: Recreate' "$tmp_dir/default.yaml"
 ! grep -q 'kubernetes.io/arch:' "$tmp_dir/default.yaml"
 if [[ -n "$expected_image" ]]; then
-  test "$(grep -F -c "image: \"${expected_image}\"" "$tmp_dir/default.yaml")" -eq 3
+  test "$(grep -F -c "image: \"${expected_image}\"" "$tmp_dir/default.yaml")" -eq 5
 fi
+grep -q '# Source: ongrid-edge/templates/telemetry-gateway-deployment.yaml' "$tmp_dir/default.yaml"
+grep -q '# Source: ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/default.yaml"
+! grep -q '# Source: ongrid-edge/templates/upgrade-preflight.yaml' "$tmp_dir/default.yaml"
+! grep -q 'ONGRID_K8S_METRICS_ENDPOINT\|containerPort: 4317\|containerPort: 4318' "$tmp_dir/default-controller.yaml"
+grep -q 'ongrid.io/telemetry-backend: "false"' "$tmp_dir/default-controller.yaml"
+grep -q 'ongrid.io/telemetry-backend: "true"' "$tmp_dir/default-gateway-service.yaml"
 grep -q 'k8s-inventory-full-sync-interval: "10m"' "$tmp_dir/default.yaml"
 grep -q 'k8s-metrics-timeout: "15s"' "$tmp_dir/default.yaml"
 grep -q 'k8s-metrics-push-timeout: "30s"' "$tmp_dir/default.yaml"
@@ -74,6 +82,17 @@ grep -q 'add: \["DAC_READ_SEARCH", "NET_ADMIN", "SETGID", "SETPCAP", "SETUID", "
 ! grep -q 'supplementalGroups:' "$tmp_dir/default.yaml"
 ! grep -q '^data:' "$tmp_dir/telemetry-secret.yaml"
 
+helm template compatibility "$chart_package" "${common_args[@]}" \
+  --set telemetryGateway.mode=embedded \
+  --set kubernetesMetrics.mode=controller \
+  >"$tmp_dir/compatibility.yaml"
+extract_source 'ongrid-edge/templates/deployment.yaml' "$tmp_dir/compatibility.yaml" "$tmp_dir/compatibility-controller.yaml"
+! grep -q '# Source: ongrid-edge/templates/telemetry-gateway-deployment.yaml' "$tmp_dir/compatibility.yaml"
+! grep -q '# Source: ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/compatibility.yaml"
+grep -q 'ONGRID_K8S_METRICS_ENDPOINT' "$tmp_dir/compatibility-controller.yaml"
+grep -q 'containerPort: 4317' "$tmp_dir/compatibility-controller.yaml"
+grep -q 'ongrid.io/telemetry-backend: "true"' "$tmp_dir/compatibility-controller.yaml"
+
 helm template split "$chart_package" "${common_args[@]}" \
   --set telemetryGateway.mode=deployment \
   --set kubernetesMetrics.mode=scraper \
@@ -88,7 +107,21 @@ grep -q 'replicas: 1' "$tmp_dir/scraper.yaml"
 grep -q 'automountServiceAccountToken: false' "$tmp_dir/scraper.yaml"
 ! grep -q 'telemetry-access-key\|telemetry-secret-key\|telemetry-traces-endpoint\|telemetry-logs-endpoint' "$tmp_dir/scraper.yaml"
 
+helm template upgrade "$chart_package" "${common_args[@]}" --is-upgrade >"$tmp_dir/upgrade.yaml"
+grep -q '# Source: ongrid-edge/templates/upgrade-preflight.yaml' "$tmp_dir/upgrade.yaml"
+test "$(grep -F -c 'helm.sh/hook: pre-upgrade' "$tmp_dir/upgrade.yaml")" -eq 4
+grep -q 'activeDeadlineSeconds: 480' "$tmp_dir/upgrade.yaml"
+grep -q -- '- prepare-k8s-upgrade' "$tmp_dir/upgrade.yaml"
+grep -q -- '- --gateway-mode=deployment' "$tmp_dir/upgrade.yaml"
+grep -q -- '- --metrics-mode=scraper' "$tmp_dir/upgrade.yaml"
+
+helm template upgrade-hook-disabled "$chart_package" "${common_args[@]}" --is-upgrade \
+  --set upgrade.migrationHook.enabled=false \
+  >"$tmp_dir/upgrade-hook-disabled.yaml"
+! grep -q '# Source: ongrid-edge/templates/upgrade-preflight.yaml' "$tmp_dir/upgrade-hook-disabled.yaml"
+
 helm template paused "$chart_package" "${common_args[@]}" \
+  --set telemetryGateway.mode=embedded \
   --set kubernetesMetrics.mode=controller \
   --set kubernetesMetrics.enabled=false \
   >"$tmp_dir/paused.yaml"
@@ -117,5 +150,7 @@ expect_template_failure 'telemetryGateway.batch requires 0 < sendSize <= maxSize
   helm template invalid-batch "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.batch.maxSize=5000
 expect_template_failure 'targetMemoryAverageValue must be below the memory_limiter soft limit' \
   helm template invalid-hpa "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.autoscaling.enabled=true --set telemetryGateway.autoscaling.targetMemoryAverageValue=650Mi
+expect_template_failure 'upgrade.migrationHook.timeout must be a whole second, minute, or hour duration' \
+  helm template invalid-upgrade-timeout "$chart_package" "${common_args[@]}" --is-upgrade --set upgrade.migrationHook.timeout=1m30s
 
 echo "Kubernetes Helm chart validation passed"

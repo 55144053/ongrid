@@ -210,10 +210,14 @@ func TestUpgradeCommandUsesManagerConfig(t *testing.T) {
 		"'oci://helm.cnb.cool/ongridio/ongrid-edge'",
 		"--version '0.9.1'",
 		"--namespace 'ongrid-system'",
-		"--reuse-values",
+		"--reset-then-reuse-values",
 		"manager.publicURL='https://manager.example.com:8443'",
 		"manager.tunnelAddr='manager.example.com:40012'",
 		"image.tag='v0.9.1'",
+		"--wait",
+		"--wait-for-jobs",
+		"--atomic",
+		"--timeout '15m'",
 	} {
 		if !strings.Contains(command, want) {
 			t.Fatalf("UpgradeCommand() = %q, missing %q", command, want)

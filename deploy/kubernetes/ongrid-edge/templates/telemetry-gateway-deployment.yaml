@@ -55,6 +55,7 @@ spec:
       labels:
         {{- include "ongrid-edge.labels" . | nindent 8 }}
         app.kubernetes.io/component: telemetry-gateway
+        {{ include "ongrid-edge.telemetryBackendLabel" . }}: "true"
     spec:
       serviceAccountName: {{ include "ongrid-edge.telemetryGatewayServiceAccount" . }}
       terminationGracePeriodSeconds: 30

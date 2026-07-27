@@ -31,6 +31,7 @@ spec:
       labels:
         {{- include "ongrid-edge.labels" . | nindent 8 }}
         app.kubernetes.io/component: controller
+        {{ include "ongrid-edge.telemetryBackendLabel" . }}: {{ ternary "true" "false" $telemetryGatewayEmbedded | quote }}
     spec:
       serviceAccountName: {{ include "ongrid-edge.controllerServiceAccount" . }}
       {{- with .Values.image.architecture }}

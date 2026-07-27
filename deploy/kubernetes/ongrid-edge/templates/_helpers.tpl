@@ -45,6 +45,14 @@ ongrid.io/cluster-id: {{ .Values.enrollment.clusterID | quote }}
 {{- printf "%s-telemetry-gateway" (include "ongrid-edge.fullname" .) -}}
 {{- end -}}
 
+{{- define "ongrid-edge.telemetryBackendLabel" -}}
+ongrid.io/telemetry-backend
+{{- end -}}
+
+{{- define "ongrid-edge.upgradeHookServiceAccount" -}}
+{{- printf "%s-upgrade-preflight" (include "ongrid-edge.fullname" .) -}}
+{{- end -}}
+
 {{- define "ongrid-edge.controllerCredentialSecretName" -}}
 {{- printf "%s-controller-credentials" (include "ongrid-edge.fullname" .) -}}
 {{- end -}}
@@ -55,7 +63,7 @@ ongrid.io/cluster-id: {{ .Values.enrollment.clusterID | quote }}
 
 {{- define "ongrid-edge.telemetryGatewayMode" -}}
 {{- $gw := default dict .Values.telemetryGateway -}}
-{{- $mode := default "embedded" $gw.mode -}}
+{{- $mode := default "deployment" $gw.mode -}}
 {{- if and (ne $mode "embedded") (ne $mode "deployment") -}}
 {{- fail "telemetryGateway.mode must be embedded or deployment" -}}
 {{- end -}}
@@ -64,7 +72,7 @@ ongrid.io/cluster-id: {{ .Values.enrollment.clusterID | quote }}
 
 {{- define "ongrid-edge.kubernetesMetricsMode" -}}
 {{- $metrics := default dict .Values.kubernetesMetrics -}}
-{{- $mode := default "controller" $metrics.mode -}}
+{{- $mode := default "scraper" $metrics.mode -}}
 {{- if and (ne $mode "controller") (ne $mode "scraper") -}}
 {{- fail "kubernetesMetrics.mode must be controller or scraper" -}}
 {{- end -}}
@@ -91,10 +99,33 @@ true
 {{- end -}}
 {{- end -}}
 
+{{- define "ongrid-edge.durationSeconds" -}}
+{{- $raw := toString . -}}
+{{- if regexMatch "^[1-9][0-9]*s$" $raw -}}
+{{- trimSuffix "s" $raw -}}
+{{- else if regexMatch "^[1-9][0-9]*m$" $raw -}}
+{{- mul (int (trimSuffix "m" $raw)) 60 -}}
+{{- else if regexMatch "^[1-9][0-9]*h$" $raw -}}
+{{- mul (int (trimSuffix "h" $raw)) 3600 -}}
+{{- else -}}
+{{- fail (printf "upgrade.migrationHook.timeout must be a whole second, minute, or hour duration, got %q" $raw) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "ongrid-edge.telemetryGatewayEnabled" -}}
 {{- $gw := default dict .Values.telemetryGateway -}}
 {{- if kindIs "bool" $gw.enabled -}}
 {{- if $gw.enabled -}}true{{- else -}}false{{- end -}}
+{{- else -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- define "ongrid-edge.upgradeMigrationHookEnabled" -}}
+{{- $upgrade := default dict .Values.upgrade -}}
+{{- $hook := default dict $upgrade.migrationHook -}}
+{{- if kindIs "bool" $hook.enabled -}}
+{{- if $hook.enabled -}}true{{- else -}}false{{- end -}}
 {{- else -}}
 true
 {{- end -}}

@@ -69,6 +69,13 @@ func main() {
 		}
 		return
 	}
+	if handled, err := runK8sUpgradeCommand(context.Background(), os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "kubernetes upgrade preparation: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	// Print-and-exit flags before anything that can fail (config load,
 	// env access). install.sh and operators rely on `ongrid-edge --version`

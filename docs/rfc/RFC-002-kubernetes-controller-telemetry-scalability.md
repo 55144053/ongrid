@@ -318,7 +318,7 @@ telemetryGateway:
 
 kubernetesMetrics:
   mode: scraper           # controller | scraper
-  enabled: true           # 切换时先设 false 停止两条路径
+  enabled: true           # 手工故障处理闸门；正常升级由 Hook 自动编排
   replicas: 1             # 第一阶段必须为 1，Helm 对其他值直接失败
   resources:
     requests:
@@ -435,38 +435,47 @@ Metrics Scraper 必须暴露：
 - `controller`：保持当前 Controller 抓 KSM 并经 tunnel 推送，作为回滚路径；
 - `scraper`：启用独立 Metrics Scraper，Controller 不再读取 KSM endpoint，也不再发送来源为 `k8s:kube-state-metrics` 的 `push_prom_samples`。
 
-`kubernetesMetrics.enabled=false` 是无重叠切换闸门：此时 Controller 不读取 KSM endpoint，独立 Metrics Scraper 也不会创建。它只用于切换窗口，正常运行应设为 `true`。
+`kubernetesMetrics.enabled=false` 是手工故障处理闸门：此时 Controller 不读取 KSM endpoint，独立 Metrics Scraper 也不会创建。正常运行和标准升级均保持 `true`，由 Chart 的 pre-upgrade Hook 自动执行无重叠交接。
 
-第一轮发布保持 `telemetryGateway.mode=embedded`、`kubernetesMetrics.mode=controller`，通过预发和少量集群显式启用新模式。完成压测和至少 7 天 soak 后，新安装默认改为 `deployment` + `scraper`；升级安装继续保留用户已设置的值。两个开关独立，便于分别灰度和回滚。
+新安装默认使用 `telemetryGateway.mode=deployment`、`kubernetesMetrics.mode=scraper`。升级要求 Helm 3.14+，使用 `--reset-then-reuse-values` 先加载新版 Chart 默认值，再覆盖旧 release 中用户显式设置的 values；旧 release 没有这两个字段时收敛到新默认。两个开关仍然独立，显式设置 `embedded` 或 `controller` 后，后续镜像升级不会强制改回新模式。
 
 ### 无感迁移
 
 - 保留现有 `ongrid-edge-telemetry-gateway.<namespace>.svc:4317/4318`；
-- 只修改 Service selector，不要求业务 Pod 改 endpoint；
-- 新 Gateway Ready 后再让 Service 切流；
-- Controller 的 embedded Collector 在 Service 完成切流后停止；
+- Service 使用稳定的 `ongrid.io/telemetry-backend=true` selector，不要求业务 Pod 改 endpoint；
+- pre-upgrade Hook 先给旧 embedded Controller 增加稳定后端标签，避免 Service selector 变更本身提前切断旧 endpoint；
+- 最终 Controller 模板显式把后端标签设为 `false` 并停止 embedded Collector，Helm 等待新 Gateway Ready；Controller Recreate 与 Gateway 首次启动之间仍允许一次短暂重连；
 - 切换期间允许短暂重连，但不能同时把同一批数据广播到两套 Gateway。
 
-KSM 迁移使用“先停旧抓取，再启新抓取”的无重叠顺序。不能在一次 Helm release 中直接从 `controller` 切到 `scraper`：Kubernetes 不保证旧 Controller 与新 Scraper 的调和顺序。
+KSM 迁移仍使用“先停旧抓取，再启新抓取”的无重叠顺序，但该顺序由同一个 Helm release 内的 pre-upgrade Hook 编排，用户只执行页面生成的一条命令：
 
-1. 先以兼容模式升级新版本，保持 `kubernetesMetrics.mode=controller`、`kubernetesMetrics.enabled=true`，确认 telemetry Secret 已填充；
-2. 执行 `helm upgrade ... --reuse-values --set kubernetesMetrics.mode=controller --set kubernetesMetrics.enabled=false --wait`；
-3. 确认新 Controller 已就绪、不再请求 KSM，且 tunnel 不再产生 `k8s:kube-state-metrics` batch；
-4. 执行 `helm upgrade ... --reuse-values --set kubernetesMetrics.mode=scraper --set kubernetesMetrics.enabled=true --wait`；
-5. 等待 Metrics Scraper 首个完整 scrape 和 remote_write 成功，对比 golden labels、样本数和关键 PromQL；
-6. 迁移窗口允许缺失一个 scrape interval，但禁止两条路径同时写同一组时序。
+```bash
+helm upgrade ongrid-edge <chart> --version <version> --namespace <namespace> \
+  --reset-then-reuse-values <manager-overrides> \
+  --wait --wait-for-jobs --atomic --timeout 15m
+```
+
+1. Helm 创建最小权限、仅本次升级存在的 Hook ServiceAccount、Role 和 Job；
+2. Hook 检查 live Controller。若旧 Controller 仍抓 KSM，则移除其 KSM endpoint、关闭 app discovery，并等待 Recreate rollout 完成；
+3. Hook 同时给仍承接 OTLP 的旧 Controller 增加稳定 Service 后端标签；
+4. Hook 成功后 Helm 才应用最终 Controller、Gateway、Scraper、Secret 和 Service；Scraper 在 telemetry Secret 字段就绪前不会启动抓取；
+5. `--wait --wait-for-jobs` 等待工作负载健康，任一步失败由 `--atomic` 回滚整个 release；
+6. 已完成拆分的集群再次升级时，Hook 只执行 GET 检查并立即退出，不 PATCH Deployment，因此纯镜像升级不会重复迁移或额外重启 Controller。
+
+迁移窗口允许缺失一个 scrape interval，但禁止两条路径同时写同一组时序。Hook 必须保持幂等和可重试；后续复杂版本在 Hook 中增加有明确前置状态、完成状态和回滚边界的迁移步骤，页面命令保持不变。
 
 ### 回滚
 
-回滚动作：
+标准升级失败由 `--atomic` 自动恢复上一 release；进入 Helm 回滚流程后，上一版 manifest 会覆盖 pre-upgrade 对旧 Controller 的过渡 patch。手工退回兼容模式也只执行一次：
 
-1. Controller 重新启用 embedded Collector；
-2. 等待其 readiness 成功；
-3. Service selector 切回 Controller；
-4. 缩容独立 Gateway Deployment；
-5. 执行 `helm upgrade ... --reuse-values --set kubernetesMetrics.mode=scraper --set kubernetesMetrics.enabled=false --wait`，停止 Metrics Scraper 并确认其不再抓取 KSM；
-6. 执行 `helm upgrade ... --reuse-values --set kubernetesMetrics.mode=controller --set kubernetesMetrics.enabled=true --wait`，恢复 Controller KSM scrape，并确认首个 tunnel batch 被 Manager 接受；
-7. 保留数据面 Secret，便于再次尝试。
+```bash
+helm upgrade ... --reset-then-reuse-values \
+  --set telemetryGateway.mode=embedded \
+  --set kubernetesMetrics.mode=controller \
+  --wait --wait-for-jobs --atomic --timeout 15m
+```
+
+Hook 会先停止 Metrics Scraper，最终 manifest 再恢复 Controller 的 embedded Collector 和 KSM scrape，并移除独立 Gateway。切换可能触发 OTLP 客户端短暂重连；完成后需要确认 Controller Ready、首个 KSM tunnel batch 已被 Manager 接受。数据面 Secret 可以保留，便于再次切换。
 
 回滚不涉及数据库 schema 回退。新增 telemetry credential 可以保留或显式吊销。
 
@@ -511,7 +520,7 @@ KSM 迁移使用“先停旧抓取，再启新抓取”的无重叠顺序。不�
 - `internal/edgeagent/k8s/remote_write_scraper.go`：复用增量解析和有界 batch，新增不依赖 tunnel/Kubernetes API 的 direct-remote-write 出口；Controller 仅在回滚模式启用旧抓取；
 - `internal/manager/biz/k8s`：签发/轮换数据面凭据并生成 Gateway 配置；
 - `internal/manager/server/edgeauth`：识别 credential scope；
-- `deploy/kubernetes/ongrid-edge`：新增 Gateway 与 Metrics Scraper Deployment、HPA、PDB、Secret、Service selector、互斥迁移逻辑和 values；
+- `deploy/kubernetes/ongrid-edge`：新增 Gateway 与 Metrics Scraper Deployment、HPA、PDB、Secret、稳定 Service selector、幂等 pre-upgrade Hook 和 values；
 - nginx：增加 telemetry-credential-authenticated metrics remote_write 精确写入口；
 - CI：增加 Gateway 与 KSM 两组新旧 mode 组合的 Helm render、单活、策略和资源校验。
 
@@ -537,12 +546,12 @@ KSM 迁移使用“先停旧抓取，再启新抓取”的无重叠顺序。不�
 
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
-| Service 切换时 endpoint 短暂为空 | telemetry 客户端重试或丢少量数据 | 新 Gateway Ready 后切 selector；SDK 配置重试 |
+| Service 切换时 endpoint 短暂为空 | telemetry 客户端重试或丢少量数据 | Hook 先标记旧 Controller，Service 使用跨模式稳定 selector，Helm 等待 Gateway Ready；SDK 配置重试 |
 | HPA 依赖 metrics-server | 无法自动扩容 | 默认固定 2 副本；安装前检查后显式启用 HPA |
 | OTLP gRPC 长连接热点 | 新副本空闲、旧副本过载 | 压测热点；鼓励多 exporter/OTLP HTTP；必要时前置代理 |
 | 每个 Gateway 都有 cluster-wide k8sattributes cache | 固定内存随副本增长 | 只提取必要字段；后续支持无 cache/Node-local 模式 |
 | 下游故障导致队列满 | 拒绝或丢数据 | memory limiter、有界内存 queue、明确告警；磁盘 queue 留作后续增强 |
-| 两条 KSM 路径迁移时重叠 | 重复或乱序样本 | 先停 Controller scrape、再启 Scraper；Helm 状态互斥；验收 remote_write 前检查旧 tunnel source 已停止 |
+| 两条 KSM 路径迁移时重叠 | 重复或乱序样本 | pre-upgrade Hook 先停 Controller scrape并等待 rollout，再由同一 release 启动 Scraper；验收 remote_write 前检查旧 tunnel source 已停止 |
 | 单活 Metrics Scraper 更新或故障 | 出现若干 scrape interval 的 KSM 指标缺口 | readiness、明确告警、快速重建；第一阶段接受短缺口，HA 必须先引入选主或分片 |
 | KSM 或 Scraper 达到单实例容量上限 | partial scrape 或状态指标缺失 | 30% headroom、sample-limit 预警、精简 collectors/labels；超限后实施 KSM 与 target 分片 |
 | 数据面凭据被窃取 | 可伪造 telemetry | scope 限制、集群级限流、Secret 最小权限、支持立即吊销 |
@@ -565,7 +574,8 @@ KSM 迁移使用“先停旧抓取，再启新抓取”的无重叠顺序。不�
 
 ## 验收标准
 
-- Helm 的 Gateway `embedded/deployment` 与 KSM `controller/scraper` 组合均能 lint、render、安装和回滚；`kubernetesMetrics.enabled=false` 不渲染 Scraper 且不给 Controller 注入 KSM 配置；非法多副本 Scraper 配置渲染失败。
+- 页面生成且只需执行一条 `helm upgrade`；Gateway `embedded/deployment` 与 KSM `controller/scraper` 组合均能 lint、render、安装和回滚；`kubernetesMetrics.enabled=false` 不渲染 Scraper 且不给 Controller 注入 KSM 配置；非法多副本 Scraper 配置渲染失败。
+- 从旧模式升级时 pre-upgrade Hook 先停止 Controller KSM 路径再应用 Scraper；已经拆分后的纯镜像升级只 GET、不 PATCH，也不触发额外 Controller rollout。
 - `deployment` 模式下 Controller Pod 内不再存在 `otelcol-contrib` 进程，也不监听 4317/4318。
 - `scraper` 模式下 Controller 不再请求 KSM endpoint，且 tunnel 中不再出现来源为 `k8s:kube-state-metrics` 的 `push_prom_samples`；Metrics Scraper 不建立 controller tunnel。
 - 2 倍目标峰值持续 5 分钟时 Controller 无 OOM、RSS 不随 telemetry 吞吐显著增长。
@@ -587,7 +597,7 @@ KSM 迁移使用“先停旧抓取，再启新抓取”的无重叠顺序。不�
 
 已确认：第一阶段同时支持 Manager 内置 Prometheus 和外部 Prometheus-compatible backend 的动态 endpoint/写凭据下发；HPA 默认关闭并固定两个 Gateway 副本；persistent queue 不进入第一阶段；Metrics Scraper 第一阶段单活，切换或故障允许短暂指标缺口。
 
-待通过 M0/M4 量化：峰值 spans/s、log MiB/s、OTLP metric points/s、最大 active series，以及 KSM 最大对象数/样本数。未取得基线与 2 倍峰值压测结果前，不调整新安装默认模式。
+待通过 M0/M4 量化：峰值 spans/s、log MiB/s、OTLP metric points/s、最大 active series，以及 KSM 最大对象数/样本数。未取得基线与 2 倍峰值压测结果前，不把当前资源 requests/limits 当成最终容量承诺。
 
 ## 变更记录
 
@@ -597,3 +607,4 @@ KSM 迁移使用“先停旧抓取，再启新抓取”的无重叠顺序。不�
 | 2026-07-22 | 补充 KSM 目标链路：独立单活 Metrics Scraper 直接 remote_write，禁止多 Gateway 重复抓取 | Codex |
 | 2026-07-22 | 关联 ADR-029，固化 Controller、Gateway 与 Metrics Scraper 的职责边界 | Codex |
 | 2026-07-22 | ADR 接受后启动实现；增加独立数据面凭据、部署模板、有界队列，以及 KSM 无重叠迁移闸门 | Codex |
+| 2026-07-27 | 将多次人工切换收敛为单次原子 Helm upgrade；增加幂等 pre-upgrade Hook、稳定 Service selector 和纯镜像升级无 PATCH 保证 | Codex |

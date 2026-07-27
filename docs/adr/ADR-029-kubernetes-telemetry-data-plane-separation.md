@@ -81,6 +81,7 @@ KSM 继续使用自己的只读 ServiceAccount list/watch Kubernetes API 并暴�
 - 现有 K8s PromQL 和告警无需改写；
 - Gateway 和 KSM scrape 使用独立模式开关：`telemetryGateway.mode=embedded|deployment`、`kubernetesMetrics.mode=controller|scraper`；KSM 另有 `kubernetesMetrics.enabled` 迁移闸门；
 - KSM 切换必须先停止旧路径，再启动新路径；不允许 Controller 和 Metrics Scraper 同时写入同一组时序。
+- 标准升级必须保持一条原子 Helm 命令；Chart 的幂等 pre-upgrade Hook 负责停止旧路径并等待完成，不能依赖操作者手工执行多次 release。
 
 Controller active-active、高可用 KSM scrape 和超大集群 KSM 分片不包含在本决策的第一阶段范围内。
 
@@ -183,7 +184,8 @@ Controller active-active、高可用 KSM scrape 和超大集群 KSM 分片不包
 4. 任一时刻至多一个有效 KSM scrape writer；
 5. 新旧链路的 `cluster_id`、`ongrid_source` 和业务标签通过 golden test 保持一致；
 6. 新路径必须具有明确的内存、batch、queue、retry 上限和至少 30% 容量余量；
-7. 第一轮发布保持旧模式默认，完成压测、故障演练和至少 7 天灰度观察后，再调整新安装默认值。
+7. 新安装默认使用 `deployment` + `scraper`；`embedded` + `controller` 作为显式回滚模式，并由 Helm 3.14+ 的 `--reset-then-reuse-values` 在后续升级中保留；
+8. 已完成迁移后的纯镜像升级不得再次 patch Controller 或触发额外迁移 rollout。
 
 本 ADR 已接受。如需改变上述职责边界、允许多副本重复 scrape 或复用 controller credential，必须新增 ADR 替代本决策。
 
