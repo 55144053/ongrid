@@ -23,7 +23,6 @@ spec:
       app.kubernetes.io/component: telemetry-gateway
 {{- end }}
 {{- if default false $autoscaling.enabled }}
----
 {{- $minReplicas := int (default 2 $autoscaling.minReplicas) -}}
 {{- $maxReplicas := int (default 10 $autoscaling.maxReplicas) -}}
 {{- $targetMemory := default "600Mi" $autoscaling.targetMemoryAverageValue -}}
@@ -38,6 +37,7 @@ spec:
 {{- if ge $targetMemoryMiB $softLimitMiB -}}
 {{- fail "telemetryGateway.autoscaling.targetMemoryAverageValue must be below the memory_limiter soft limit" -}}
 {{- end -}}
+---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:

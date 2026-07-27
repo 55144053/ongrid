@@ -156,7 +156,10 @@ telemetryGateway:
       cpu: 1000m
       memory: 1Gi
   autoscaling:
-    enabled: false
+    # Requires the standard metrics.k8s.io API (normally provided by
+    # metrics-server). Disable this flag to fall back to a fixed replica count
+    # on clusters that intentionally do not expose resource metrics.
+    enabled: true
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilizationPercentage: 60

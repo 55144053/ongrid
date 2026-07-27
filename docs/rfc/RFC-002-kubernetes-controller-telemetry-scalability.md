@@ -296,7 +296,7 @@ telemetryGateway:
   mode: deployment       # embedded | deployment
   replicas: 2
   autoscaling:
-    enabled: false
+    enabled: true
     minReplicas: 2
     maxReplicas: 10
     targetCPUUtilizationPercentage: 60
@@ -331,8 +331,9 @@ kubernetesMetrics:
 
 部署约束：
 
-- 默认固定两个副本；确认集群安装了 metrics-server 后再启用 HPA；
+- 默认启用 HPA，要求集群提供标准 `metrics.k8s.io` API（通常由 metrics-server 提供）；未提供该 API 的集群必须关闭 HPA 并回退到固定两个副本；
 - HPA 最小副本数不得小于 2；
+- HPA 开启时 Deployment manifest 不渲染 `spec.replicas`，副本数只由 HPA 持有，后续 Helm/镜像升级不得重置实时副本数；
 - 内存 HPA 使用明确的 `averageValue`，不能把 limit 百分比误写成 request 利用率；
 - `PodDisruptionBudget.minAvailable: 1`；
 - 使用 `topologySpreadConstraints`，尽量分散到不同 Node/zone；
@@ -547,7 +548,7 @@ Hook 会先停止 Metrics Scraper，最终 manifest 再恢复 Controller 的 emb
 | 风险 | 影响 | 缓解 |
 | --- | --- | --- |
 | Service 切换时 endpoint 短暂为空 | telemetry 客户端重试或丢少量数据 | Hook 先标记旧 Controller，Service 使用跨模式稳定 selector，Helm 等待 Gateway Ready；SDK 配置重试 |
-| HPA 依赖 metrics-server | 无法自动扩容 | 默认固定 2 副本；安装前检查后显式启用 HPA |
+| HPA 依赖 `metrics.k8s.io` | 无法自动扩容 | 部署前确认 Metrics API 可用；无该 API 的集群显式关闭 HPA，固定保持 2 副本 |
 | OTLP gRPC 长连接热点 | 新副本空闲、旧副本过载 | 压测热点；鼓励多 exporter/OTLP HTTP；必要时前置代理 |
 | 每个 Gateway 都有 cluster-wide k8sattributes cache | 固定内存随副本增长 | 只提取必要字段；后续支持无 cache/Node-local 模式 |
 | 下游故障导致队列满 | 拒绝或丢数据 | memory limiter、有界内存 queue、明确告警；磁盘 queue 留作后续增强 |
@@ -595,7 +596,7 @@ Hook 会先停止 Metrics Scraper，最终 manifest 再恢复 Controller 的 emb
 
 ## 已确认与待量化事项
 
-已确认：第一阶段同时支持 Manager 内置 Prometheus 和外部 Prometheus-compatible backend 的动态 endpoint/写凭据下发；HPA 默认关闭并固定两个 Gateway 副本；persistent queue 不进入第一阶段；Metrics Scraper 第一阶段单活，切换或故障允许短暂指标缺口。
+已确认：第一阶段同时支持 Manager 内置 Prometheus 和外部 Prometheus-compatible backend 的动态 endpoint/写凭据下发；Gateway HPA 默认开启，依赖集群提供标准 `metrics.k8s.io` API，最少保留两个副本，并允许通过 `telemetryGateway.autoscaling.enabled=false` 回退到固定副本；persistent queue 不进入第一阶段；Metrics Scraper 第一阶段单活，切换或故障允许短暂指标缺口。
 
 待通过 M0/M4 量化：峰值 spans/s、log MiB/s、OTLP metric points/s、最大 active series，以及 KSM 最大对象数/样本数。未取得基线与 2 倍峰值压测结果前，不把当前资源 requests/limits 当成最终容量承诺。
 
@@ -608,3 +609,4 @@ Hook 会先停止 Metrics Scraper，最终 manifest 再恢复 Controller 的 emb
 | 2026-07-22 | 关联 ADR-029，固化 Controller、Gateway 与 Metrics Scraper 的职责边界 | Codex |
 | 2026-07-22 | ADR 接受后启动实现；增加独立数据面凭据、部署模板、有界队列，以及 KSM 无重叠迁移闸门 | Codex |
 | 2026-07-27 | 将多次人工切换收敛为单次原子 Helm upgrade；增加幂等 pre-upgrade Hook、稳定 Service selector 和纯镜像升级无 PATCH 保证 | Codex |
+| 2026-07-27 | Gateway HPA 改为默认开启；HPA 独占副本数，固定副本模式保留为无 Metrics API 集群的回滚选项 | Codex |

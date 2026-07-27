@@ -45,6 +45,7 @@ extract_source 'ongrid-edge/templates/telemetry-credentials-secret.yaml' "$tmp_d
 extract_source 'ongrid-edge/templates/deployment.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-controller.yaml"
 extract_source 'ongrid-edge/templates/daemonset.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-node.yaml"
 extract_source 'ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-scraper.yaml"
+extract_source 'ongrid-edge/templates/telemetry-gateway-deployment.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-gateway.yaml"
 extract_source 'ongrid-edge/templates/telemetry-gateway-service.yaml' "$tmp_dir/default.yaml" "$tmp_dir/default-gateway-service.yaml"
 grep -q 'type: Recreate' "$tmp_dir/default.yaml"
 ! grep -q 'kubernetes.io/arch:' "$tmp_dir/default.yaml"
@@ -53,6 +54,12 @@ if [[ -n "$expected_image" ]]; then
 fi
 grep -q '# Source: ongrid-edge/templates/telemetry-gateway-deployment.yaml' "$tmp_dir/default.yaml"
 grep -q '# Source: ongrid-edge/templates/metrics-scraper-deployment.yaml' "$tmp_dir/default.yaml"
+grep -q 'kind: HorizontalPodAutoscaler' "$tmp_dir/default.yaml"
+grep -q 'minReplicas: 2' "$tmp_dir/default.yaml"
+grep -q 'maxReplicas: 10' "$tmp_dir/default.yaml"
+grep -q 'averageUtilization: 60' "$tmp_dir/default.yaml"
+grep -q 'averageValue: 600Mi' "$tmp_dir/default.yaml"
+! grep -q '^  replicas:' "$tmp_dir/default-gateway.yaml"
 ! grep -q '# Source: ongrid-edge/templates/upgrade-preflight.yaml' "$tmp_dir/default.yaml"
 ! grep -q 'ONGRID_K8S_METRICS_ENDPOINT\|containerPort: 4317\|containerPort: 4318' "$tmp_dir/default-controller.yaml"
 grep -q 'ongrid.io/telemetry-backend: "false"' "$tmp_dir/default-controller.yaml"
@@ -199,17 +206,28 @@ grep -A1 'name: ONGRID_K8S_TELEMETRY_REQUIRED' "$tmp_dir/paused-controller.yaml"
 helm template hpa "$chart_package" "${common_args[@]}" \
   --set telemetryGateway.mode=deployment \
   --set telemetryGateway.autoscaling.enabled=true \
+  --set telemetryGateway.autoscaling.minReplicas=3 \
+  --set telemetryGateway.autoscaling.maxReplicas=12 \
   >"$tmp_dir/hpa.yaml"
 grep -q '# Source: ongrid-edge/templates/telemetry-gateway-policy.yaml' "$tmp_dir/hpa.yaml"
 grep -q 'kind: HorizontalPodAutoscaler' "$tmp_dir/hpa.yaml"
+grep -q 'minReplicas: 3' "$tmp_dir/hpa.yaml"
+grep -q 'maxReplicas: 12' "$tmp_dir/hpa.yaml"
 grep -q 'averageValue: 600Mi' "$tmp_dir/hpa.yaml"
+
+helm template fixed-gateway "$chart_package" "${common_args[@]}" \
+  --set telemetryGateway.autoscaling.enabled=false \
+  >"$tmp_dir/fixed-gateway.yaml"
+extract_source 'ongrid-edge/templates/telemetry-gateway-deployment.yaml' "$tmp_dir/fixed-gateway.yaml" "$tmp_dir/fixed-gateway-deployment.yaml"
+! grep -q 'kind: HorizontalPodAutoscaler' "$tmp_dir/fixed-gateway.yaml"
+grep -q '^  replicas: 2' "$tmp_dir/fixed-gateway-deployment.yaml"
 
 expect_template_failure 'kubernetesMetrics.mode must be controller or scraper' \
   helm template invalid-mode "$chart_package" "${common_args[@]}" --set kubernetesMetrics.mode=invalid
 expect_template_failure 'kubernetesMetrics.replicas must be 1' \
   helm template invalid-scraper "$chart_package" "${common_args[@]}" --set kubernetesMetrics.mode=scraper --set kubernetesMetrics.replicas=2
 expect_template_failure 'telemetryGateway.replicas must be at least 2' \
-  helm template invalid-gateway "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.replicas=1
+  helm template invalid-gateway "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.autoscaling.enabled=false --set telemetryGateway.replicas=1
 expect_template_failure 'telemetryGateway.memoryLimiter.limitMiB must be at most 80%' \
   helm template invalid-limiter "$chart_package" "${common_args[@]}" --set telemetryGateway.mode=deployment --set telemetryGateway.memoryLimiter.limitMiB=900
 expect_template_failure 'telemetryGateway.batch requires 0 < sendSize <= maxSize <= 4096' \
