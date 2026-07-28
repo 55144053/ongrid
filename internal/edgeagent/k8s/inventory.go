@@ -936,6 +936,9 @@ func (c *apiClient) watch(ctx context.Context, apiPath, resourceVersion string, 
 		if rv := eventResourceVersion(event); rv != "" {
 			latest = rv
 		}
+		if err := watchEventError(event); err != nil {
+			return latest, err
+		}
 		if onEvent != nil {
 			if err := onEvent(event); err != nil {
 				return latest, err
@@ -973,6 +976,35 @@ func eventResourceVersion(event k8sWatchEvent) string {
 		return ""
 	}
 	return strings.TrimSpace(meta.Metadata.ResourceVersion)
+}
+
+func watchEventError(event k8sWatchEvent) error {
+	if !strings.EqualFold(strings.TrimSpace(event.Type), "ERROR") {
+		return nil
+	}
+	if len(event.Object) == 0 {
+		return errors.New("kubernetes watch error event object is empty")
+	}
+	var status struct {
+		Code    int    `json:"code"`
+		Reason  string `json:"reason"`
+		Message string `json:"message"`
+	}
+	if err := json.Unmarshal(event.Object, &status); err != nil {
+		return fmt.Errorf("decode kubernetes watch error event: %w", err)
+	}
+	reason := strings.TrimSpace(status.Reason)
+	switch {
+	case status.Code == http.StatusGone || strings.EqualFold(reason, "Expired"):
+		return errResourceExpired
+	case status.Code == http.StatusForbidden || strings.EqualFold(reason, "Forbidden"):
+		return errForbidden
+	case status.Code == http.StatusNotFound || strings.EqualFold(reason, "NotFound"):
+		return errNotFound
+	default:
+		return fmt.Errorf("kubernetes watch error event: code=%d reason=%q message=%q",
+			status.Code, reason, strings.TrimSpace(status.Message))
+	}
 }
 
 type objectMeta struct {

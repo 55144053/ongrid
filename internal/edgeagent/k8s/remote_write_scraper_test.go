@@ -210,6 +210,39 @@ func TestRemoteWriteScraperDiscoversApplicationTargets(t *testing.T) {
 	t.Fatal("discovered application metric was not written")
 }
 
+func TestRemoteWriteScraperKeepsCoreReadyWhenAppDiscoveryFails(t *testing.T) {
+	metricsServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		_, _ = w.Write([]byte("kube_node_info{node=\"node-a\"} 1\n"))
+	}))
+	defer metricsServer.Close()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "temporarily unavailable", http.StatusServiceUnavailable)
+	}))
+	defer apiServer.Close()
+
+	writer := &recordingRemoteWriteWriter{}
+	scraper, err := newRemoteWriteScraper(writer, RemoteWriteScraperConfig{
+		ClusterID:    7,
+		Endpoint:     metricsServer.URL,
+		DiscoverApps: true,
+		Interval:     time.Second,
+		Timeout:      time.Second,
+		PushTimeout:  time.Second,
+		MaxRetries:   1,
+	}, slog.Default(), nil, &apiClient{baseURL: apiServer.URL, http: apiServer.Client()})
+	if err != nil {
+		t.Fatalf("newRemoteWriteScraper() error = %v", err)
+	}
+	if !scraper.scrapeAndWrite(context.Background()) {
+		t.Fatal("core scrape failed when optional application discovery was unavailable")
+	}
+	if !scraper.Ready() {
+		t.Fatal("scraper was not ready after a successful core scrape")
+	}
+}
+
 func TestRemoteWriteScraperCapsRetries(t *testing.T) {
 	writer := &recordingRemoteWriteWriter{err: errors.New("backend unavailable")}
 	scraper, err := NewRemoteWriteScraper(writer, RemoteWriteScraperConfig{

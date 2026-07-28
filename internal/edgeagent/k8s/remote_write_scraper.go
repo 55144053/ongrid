@@ -122,10 +122,12 @@ func newRemoteWriteScraper(writer RemoteWriteWriter, cfg RemoteWriteScraperConfi
 	return &RemoteWriteScraper{writer: writer, cfg: cfg, log: log, api: api, metrics: observer}, nil
 }
 
-// Ready reports whether the most recent required discovery, core scrape, and
-// remote_write cycle succeeded. Individual application endpoints report their
-// own up=0 series and do not take a healthy kube-state-metrics scraper offline.
-// It remains false until the first required cycle.
+// Ready reports whether the most recent required core scrape and remote_write
+// cycle succeeded. When a core endpoint is configured, optional application
+// discovery and application endpoints degrade independently and do not take a
+// healthy kube-state-metrics scraper offline. Discovery-only configurations
+// still require discovery to succeed. It remains false until the first
+// required cycle.
 func (s *RemoteWriteScraper) Ready() bool {
 	return s != nil && s.ready.Load()
 }
@@ -149,8 +151,8 @@ func (s *RemoteWriteScraper) Run(ctx context.Context) error {
 
 func (s *RemoteWriteScraper) scrapeAndWrite(ctx context.Context) bool {
 	targets, discoveryOK := s.targets(ctx)
-	cycleOK := discoveryOK
 	hasCoreTarget := s.cfg.Endpoint != ""
+	cycleOK := discoveryOK || hasCoreTarget
 	for _, target := range targets {
 		success := s.scrapeTargetAndWrite(ctx, target)
 		isAppTarget := target.SourceLabel == k8sAppMetricsSource
