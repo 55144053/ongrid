@@ -641,7 +641,8 @@ package-all: ## [release] 打 amd64 + arm64 两个生产安装包到 dist/out/
 		[ -f "$$f" ] && cat "$$f"; \
 	done
 
-test-release-package: ## [test] 校验发布包仅支持 Compose 且不含 Manager systemd 文件
+test-release-package: ## [test] 校验安装 URL 与 Compose 发布包内容
+	bash scripts/test-public-url.sh
 	bash scripts/test-compose-release-package.sh
 
 .PHONY: dist-clean

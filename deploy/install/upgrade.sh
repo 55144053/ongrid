@@ -18,6 +18,14 @@ log_info()  { printf '%s[INFO]%s %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
 log_warn()  { printf '%s[WARN]%s %s\n'  "$C_YELLOW" "$C_RESET" "$*"; }
 log_error() { printf '%s[ERROR]%s %s\n' "$C_RED"    "$C_RESET" "$*" >&2; }
 
+PUBLIC_URL_LIB="$SCRIPT_DIR/public-url.sh"
+if [[ ! -r "$PUBLIC_URL_LIB" ]]; then
+    log_error "upgrade package is missing public-url.sh"
+    exit 1
+fi
+# shellcheck source=public-url.sh
+source "$PUBLIC_URL_LIB"
+
 generate_self_signed_tls_cert() {
     local cert_dir="$1"
     local cert_file="$cert_dir/tls.crt"
@@ -213,6 +221,16 @@ MIGRATION_HELPER_IMAGE="docker.cnb.cool/ongridio/ongrid:${NEW_VERSION}"
 
 OLD_VERSION=$(grep -E '^ONGRID_VERSION=' "$ENV_FILE" | cut -d= -f2- | tr -d '[:space:]' || true)
 log_info "old version: ${OLD_VERSION:-unknown}"
+
+# Reject malformed values before pulling images or stopping the current stack.
+# Empty remains supported for legacy installs that intentionally disable the
+# data plane; install.sh always writes a non-empty value for new installs.
+CONFIGURED_PUBLIC_URL=$(grep -E '^ONGRID_PUBLIC_URL=' "$ENV_FILE" 2>/dev/null | tail -n 1 | cut -d= -f2- || true)
+if [[ -n "$CONFIGURED_PUBLIC_URL" ]] && ! ongrid_is_valid_public_url "$CONFIGURED_PUBLIC_URL"; then
+    log_error "invalid ONGRID_PUBLIC_URL in ${ENV_FILE}; expected http(s)://host[:port]"
+    log_error "correct it before retrying; the existing stack was not stopped"
+    exit 1
+fi
 
 # Validate the new Compose model and pull every exact image before stopping the
 # existing stack. Registry or manifest failures therefore leave the old version
