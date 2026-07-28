@@ -28,7 +28,7 @@ const cluster = {
   inventory_sync_duration_ms: 51,
   created_at: '2026-06-29T09:00:00Z',
   updated_at: '2026-06-29T10:00:00Z',
-  upgrade_command: "helm upgrade ongrid-edge 'oci://helm.cnb.cool/ongridio/ongrid-edge' --version '0.10.0' --namespace 'ongrid-system' --reuse-values --set-string manager.publicURL='https://manager.example' --set-string manager.tunnelAddr='manager.example:40012' --set-string manager.tlsInsecure=true",
+  upgrade_command: "helm upgrade ongrid-edge 'oci://helm.cnb.cool/ongridio/ongrid-edge' --version '0.10.0' --namespace 'ongrid-system' --reset-then-reuse-values --set-string manager.publicURL='https://manager.example' --set-string manager.tunnelAddr='manager.example:40012' --set-string manager.tlsInsecure=true --wait --wait-for-jobs --atomic --timeout '15m'",
 };
 
 function ChatStateProbe() {
@@ -460,13 +460,15 @@ describe('KubernetesPage', () => {
 
     fireEvent.click(await screen.findByRole('button', { name: '升级命令' }));
 
-    expect(screen.getByText('Helm 升级命令')).toBeInTheDocument();
+    expect(screen.getByText('一键 Helm 升级')).toBeInTheDocument();
     const command = screen.getByText(/helm upgrade ongrid-edge/);
     expect(command).toHaveTextContent("'oci://helm.cnb.cool/ongridio/ongrid-edge'");
     expect(command).toHaveTextContent("--version '0.10.0'");
     expect(command).toHaveTextContent("--namespace 'ongrid-system'");
-    expect(command).toHaveTextContent('--reuse-values');
+    expect(command).toHaveTextContent('--reset-then-reuse-values');
     expect(command).toHaveTextContent("manager.tunnelAddr='manager.example:40012'");
+    expect(command).toHaveTextContent('--wait-for-jobs');
+    expect(command).toHaveTextContent('--atomic');
   });
 
   it('已恢复的 Warning Event 不进入健康结论和异常线索', async () => {

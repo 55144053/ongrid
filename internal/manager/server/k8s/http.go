@@ -41,6 +41,7 @@ type Service interface {
 	RotateBootstrapToken(ctx context.Context, id uint64) (*biz.ClusterRegistration, error)
 	DeleteCluster(ctx context.Context, in biz.DeleteClusterInput) error
 	Enroll(ctx context.Context, in biz.EnrollInput) (*biz.EnrollResult, error)
+	RefreshTelemetryConfig(ctx context.Context, controllerEdgeID uint64, proof biz.TelemetryCredentialProof) (*biz.TelemetryConfig, error)
 }
 
 type Handler struct {
@@ -122,6 +123,7 @@ func (h *Handler) getClusterHealth(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) RegisterInternal(r chi.Router) {
 	r.Post("/internal/k8s/enroll", h.enroll)
+	r.Post("/internal/k8s/telemetry-config", h.refreshTelemetryConfig)
 }
 
 // @Summary Create Kubernetes cluster enrollment
@@ -481,7 +483,33 @@ func (h *Handler) enroll(w http.ResponseWriter, r *http.Request) {
 		SecretKey:        out.SecretKey,
 		CloudAddr:        out.CloudAddr,
 		ManagerPublicURL: out.ManagerPublicURL,
+		Telemetry:        telemetryConfigDTO(out.Telemetry),
 	})
+}
+
+// @Summary Refresh Kubernetes telemetry data-plane configuration
+// @Router /internal/k8s/telemetry-config [post]
+// @Success 200 {object} telemetryConfigResponse
+func (h *Handler) refreshTelemetryConfig(w http.ResponseWriter, r *http.Request) {
+	edgeID, err := strconv.ParseUint(strings.TrimSpace(r.Header.Get("X-Edge-Id")), 10, 64)
+	if err != nil || edgeID == 0 {
+		writeErr(w, errs.ErrUnauthorized)
+		return
+	}
+	var req telemetryRefreshRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		writeErr(w, err)
+		return
+	}
+	out, err := h.svc.RefreshTelemetryConfig(r.Context(), edgeID, biz.TelemetryCredentialProof{
+		AccessKey: req.AccessKey,
+		SecretKey: req.SecretKey,
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, telemetryConfigDTO(out))
 }
 
 func (h *Handler) requireAdmin(next http.Handler) http.Handler {
@@ -511,6 +539,11 @@ type enrollRequest struct {
 	Namespace    string   `json:"namespace,omitempty"`
 	AgentVersion string   `json:"agent_version,omitempty"`
 	Capabilities []string `json:"capabilities,omitempty"`
+}
+
+type telemetryRefreshRequest struct {
+	AccessKey string `json:"access_key,omitempty"`
+	SecretKey string `json:"secret_key,omitempty"`
 }
 
 type clusterDTO struct {
@@ -657,14 +690,64 @@ type eventDTO struct {
 }
 
 type enrollResponse struct {
-	ClusterID        uint64 `json:"cluster_id"`
-	Role             string `json:"role"`
-	Mode             string `json:"mode"`
-	EdgeID           uint64 `json:"edge_id"`
-	AccessKey        string `json:"access_key"`
-	SecretKey        string `json:"secret_key"`
-	CloudAddr        string `json:"cloud_addr,omitempty"`
-	ManagerPublicURL string `json:"manager_public_url,omitempty"`
+	ClusterID        uint64                   `json:"cluster_id"`
+	Role             string                   `json:"role"`
+	Mode             string                   `json:"mode"`
+	EdgeID           uint64                   `json:"edge_id"`
+	AccessKey        string                   `json:"access_key"`
+	SecretKey        string                   `json:"secret_key"`
+	CloudAddr        string                   `json:"cloud_addr,omitempty"`
+	ManagerPublicURL string                   `json:"manager_public_url,omitempty"`
+	Telemetry        *telemetryConfigResponse `json:"telemetry,omitempty"`
+}
+
+type telemetryConfigResponse struct {
+	ClusterID              uint64 `json:"cluster_id"`
+	AccessKey              string `json:"access_key"`
+	SecretKey              string `json:"secret_key"`
+	TracesEndpoint         string `json:"traces_endpoint,omitempty"`
+	TracesAuthMode         string `json:"traces_auth_mode,omitempty"`
+	TracesBasicUser        string `json:"traces_basic_user,omitempty"`
+	TracesBasicPass        string `json:"traces_basic_pass,omitempty"`
+	TracesTLSInsecure      bool   `json:"traces_tls_insecure,omitempty"`
+	LogsEndpoint           string `json:"logs_endpoint,omitempty"`
+	LogsAuthMode           string `json:"logs_auth_mode,omitempty"`
+	LogsBasicUser          string `json:"logs_basic_user,omitempty"`
+	LogsBasicPass          string `json:"logs_basic_pass,omitempty"`
+	LogsTLSInsecure        bool   `json:"logs_tls_insecure,omitempty"`
+	RemoteWriteEndpoint    string `json:"remote_write_endpoint,omitempty"`
+	RemoteWriteBearer      string `json:"remote_write_bearer,omitempty"`
+	RemoteWriteBasicUser   string `json:"remote_write_basic_user,omitempty"`
+	RemoteWriteBasicPass   string `json:"remote_write_basic_pass,omitempty"`
+	RemoteWriteTLSInsecure bool   `json:"remote_write_tls_insecure,omitempty"`
+	RemoteWriteTLSCAPEM    string `json:"remote_write_tls_ca_pem,omitempty"`
+}
+
+func telemetryConfigDTO(in *biz.TelemetryConfig) *telemetryConfigResponse {
+	if in == nil {
+		return nil
+	}
+	return &telemetryConfigResponse{
+		ClusterID:              in.ClusterID,
+		AccessKey:              in.AccessKey,
+		SecretKey:              in.SecretKey,
+		TracesEndpoint:         in.TracesEndpoint,
+		TracesAuthMode:         in.TracesAuthMode,
+		TracesBasicUser:        in.TracesBasicUser,
+		TracesBasicPass:        in.TracesBasicPass,
+		TracesTLSInsecure:      in.TracesTLSInsecure,
+		LogsEndpoint:           in.LogsEndpoint,
+		LogsAuthMode:           in.LogsAuthMode,
+		LogsBasicUser:          in.LogsBasicUser,
+		LogsBasicPass:          in.LogsBasicPass,
+		LogsTLSInsecure:        in.LogsTLSInsecure,
+		RemoteWriteEndpoint:    in.RemoteWriteEndpoint,
+		RemoteWriteBearer:      in.RemoteWriteBearer,
+		RemoteWriteBasicUser:   in.RemoteWriteBasicUser,
+		RemoteWriteBasicPass:   in.RemoteWriteBasicPass,
+		RemoteWriteTLSInsecure: in.RemoteWriteTLSInsecure,
+		RemoteWriteTLSCAPEM:    in.RemoteWriteTLSCAPEM,
+	}
 }
 
 func registrationDTO(in *biz.ClusterRegistration) clusterRegistrationDTO {

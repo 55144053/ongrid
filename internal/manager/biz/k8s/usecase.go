@@ -21,6 +21,7 @@ import (
 	model "github.com/ongridio/ongrid/internal/manager/model/k8s"
 	"github.com/ongridio/ongrid/internal/pkg/errs"
 	"github.com/ongridio/ongrid/internal/pkg/k8sredact"
+	"github.com/ongridio/ongrid/internal/pkg/passwd"
 	"github.com/ongridio/ongrid/internal/pkg/tunnel"
 )
 
@@ -31,6 +32,8 @@ const (
 	eventRetentionBatchLimit    = 1000
 	bootstrapTokenBytes         = 32
 	defaultK8sChartRef          = "oci://helm.cnb.cool/ongridio/ongrid-edge"
+	telemetryAuthModeTelemetry  = "telemetry"
+	telemetryAuthModeBackend    = "backend"
 )
 
 // Repository is the k8s bounded context persistence contract.
@@ -44,7 +47,9 @@ type Repository interface {
 	UpdateClusterTokens(ctx context.Context, id uint64, controllerTokenHash, nodeTokenHash string) error
 	UpdateClusterController(ctx context.Context, id uint64, in ClusterControllerRegistration) error
 	TouchClusterControllerHeartbeat(ctx context.Context, edgeID uint64, at time.Time) error
-	BindControllerEnrollment(ctx context.Context, id uint64, registration ClusterControllerRegistration, installation *model.Installation) error
+	BindControllerEnrollment(ctx context.Context, id uint64, registration ClusterControllerRegistration, installation *model.Installation, telemetryCredential *model.TelemetryCredential) error
+	UpsertTelemetryCredential(ctx context.Context, telemetryCredential *model.TelemetryCredential) error
+	GetTelemetryCredentialByAccessKey(ctx context.Context, accessKey string) (*model.TelemetryCredential, error)
 	UpdateClusterInventorySync(ctx context.Context, id uint64, in ClusterInventorySync) error
 	UpdateClusterTopologyNode(ctx context.Context, id, nodeID uint64) error
 	UpdateDeviceTopologyNode(ctx context.Context, id, nodeID uint64) error
@@ -163,11 +168,52 @@ type Config struct {
 	EventCleanupInterval time.Duration
 }
 
+// RemoteWriteTarget is the exact data-plane destination published to a
+// Kubernetes cluster. UseTelemetryCredential means the endpoint is the
+// manager's auth_request-gated proxy; otherwise the backend-specific auth is
+// copied into the cluster telemetry Secret.
+type RemoteWriteTarget struct {
+	Endpoint               string
+	BearerToken            string
+	BasicUser              string
+	BasicPassword          string
+	TLSInsecure            bool
+	TLSCAPEM               string
+	UseTelemetryCredential bool
+}
+
+type RemoteWriteResolver interface {
+	ResolveRemoteWrite(ctx context.Context) (RemoteWriteTarget, error)
+}
+
+const (
+	TelemetrySignalTraces = "traces"
+	TelemetrySignalLogs   = "logs"
+)
+
+// TelemetryTarget is an exact trace or log destination published to a
+// Kubernetes telemetry gateway. Manager-proxied targets use the cluster's
+// telemetry credential; external targets carry only their backend-specific
+// basic auth and TLS policy.
+type TelemetryTarget struct {
+	Endpoint               string
+	BasicUser              string
+	BasicPassword          string
+	TLSInsecure            bool
+	UseTelemetryCredential bool
+}
+
+type TelemetryTargetResolver interface {
+	ResolveTelemetryTarget(ctx context.Context, signal string) (TelemetryTarget, error)
+}
+
 type Usecase struct {
 	repo               Repository
 	edgeIssuer         EdgeIssuer
 	edgeRemover        EdgeRemover
 	topology           TopologyMirror
+	remoteWrite        RemoteWriteResolver
+	telemetryTargets   TelemetryTargetResolver
 	cfg                Config
 	enrollmentLocksMu  sync.Mutex
 	enrollmentLocks    map[string]*enrollmentLock
@@ -204,6 +250,14 @@ func NewUsecase(repo Repository, edgeIssuer EdgeIssuer, cfg Config) *Usecase {
 }
 
 func (u *Usecase) SetTopologyMirror(m TopologyMirror) { u.topology = m }
+
+// SetRemoteWriteResolver wires the active Prometheus-compatible write target.
+// It is called once during manager startup before the HTTP server is exposed.
+func (u *Usecase) SetRemoteWriteResolver(r RemoteWriteResolver) { u.remoteWrite = r }
+
+// SetTelemetryTargetResolver wires the active Loki and Tempo ingest targets.
+// It is called once during manager startup before the HTTP server is exposed.
+func (u *Usecase) SetTelemetryTargetResolver(r TelemetryTargetResolver) { u.telemetryTargets = r }
 
 func (u *Usecase) EventCleanupInterval() time.Duration {
 	if u == nil || u.cfg.EventCleanupInterval <= 0 {
@@ -990,6 +1044,41 @@ type EnrollResult struct {
 	SecretKey        string
 	CloudAddr        string
 	ManagerPublicURL string
+	Telemetry        *TelemetryConfig
+}
+
+// TelemetryConfig is returned only to a controller enrollment and is written
+// by that controller into a Kubernetes Secret. Secrets are never persisted in
+// plaintext by manager.
+type TelemetryConfig struct {
+	ClusterID              uint64
+	AccessKey              string
+	SecretKey              string
+	TracesEndpoint         string
+	TracesAuthMode         string
+	TracesBasicUser        string
+	TracesBasicPass        string
+	TracesTLSInsecure      bool
+	LogsEndpoint           string
+	LogsAuthMode           string
+	LogsBasicUser          string
+	LogsBasicPass          string
+	LogsTLSInsecure        bool
+	RemoteWriteEndpoint    string
+	RemoteWriteBearer      string
+	RemoteWriteBasicUser   string
+	RemoteWriteBasicPass   string
+	RemoteWriteTLSInsecure bool
+	RemoteWriteTLSCAPEM    string
+}
+
+// TelemetryCredentialProof lets an authenticated controller prove that the
+// current data-plane credential is still available in its Kubernetes Secret.
+// Manager verifies the secret against the stored hash and can then republish
+// changed endpoints without rotating a live credential.
+type TelemetryCredentialProof struct {
+	AccessKey string
+	SecretKey string
 }
 
 func (u *Usecase) Enroll(ctx context.Context, in EnrollInput) (*EnrollResult, error) {
@@ -1024,6 +1113,49 @@ func (u *Usecase) Enroll(ctx context.Context, in EnrollInput) (*EnrollResult, er
 	default:
 		return nil, errors.Join(errs.ErrInvalid, fmt.Errorf("unsupported k8s enroll role %q", in.Role))
 	}
+}
+
+// RefreshTelemetryConfig republishes endpoints while preserving a valid
+// write-only credential. It rotates only when the controller has no usable
+// telemetry credential, which avoids a Secret-projection/reload 401 window on
+// every controller restart.
+func (u *Usecase) RefreshTelemetryConfig(ctx context.Context, controllerEdgeID uint64, proof TelemetryCredentialProof) (*TelemetryConfig, error) {
+	if u.repo == nil {
+		return nil, errs.ErrNotWiredYet
+	}
+	if controllerEdgeID == 0 {
+		return nil, errors.Join(errs.ErrInvalid, fmt.Errorf("controller edge id is required"))
+	}
+	cluster, err := u.repo.GetClusterByControllerEdge(ctx, controllerEdgeID)
+	if err != nil {
+		return nil, err
+	}
+	proof.AccessKey = strings.TrimSpace(proof.AccessKey)
+	proof.SecretKey = strings.TrimSpace(proof.SecretKey)
+	if (proof.AccessKey == "") != (proof.SecretKey == "") {
+		return nil, errors.Join(errs.ErrInvalid, fmt.Errorf("telemetry credential proof requires both access key and secret key"))
+	}
+	if proof.AccessKey != "" {
+		current, lookupErr := u.repo.GetTelemetryCredentialByAccessKey(ctx, proof.AccessKey)
+		if lookupErr == nil && current != nil && current.ClusterID == cluster.ID && passwd.Verify(proof.SecretKey, current.SecretKeyHash) {
+			return u.resolveTelemetryConfig(ctx, cluster.ID, proof.AccessKey, proof.SecretKey)
+		}
+		if lookupErr != nil && !errors.Is(lookupErr, errs.ErrNotFound) {
+			return nil, fmt.Errorf("look up kubernetes telemetry credential: %w", lookupErr)
+		}
+	}
+	credential, accessKey, secretKey, err := newTelemetryCredential(cluster.ID)
+	if err != nil {
+		return nil, err
+	}
+	config, err := u.resolveTelemetryConfig(ctx, cluster.ID, accessKey, secretKey)
+	if err != nil {
+		return nil, fmt.Errorf("resolve kubernetes telemetry config: %w", err)
+	}
+	if err := u.repo.UpsertTelemetryCredential(ctx, credential); err != nil {
+		return nil, fmt.Errorf("rotate kubernetes telemetry credential: %w", err)
+	}
+	return config, nil
 }
 
 func (u *Usecase) lockEnrollment(clusterID uint64, role, nodeName string) func() {
@@ -1763,14 +1895,150 @@ func (u *Usecase) enrollController(ctx context.Context, c *model.Cluster, in Enr
 		CapabilitiesJSON: capabilitiesJSON,
 		LastSeenAt:       &ts,
 	}
-	if err := u.repo.BindControllerEnrollment(ctx, c.ID, registration, installation); err != nil {
+	telemetryCredential, telemetryAccessKey, telemetrySecretKey, err := newTelemetryCredential(c.ID)
+	if err != nil {
+		if created {
+			return nil, u.compensateCreatedEdge(ctx, cred.EdgeID, err)
+		}
+		return nil, err
+	}
+	telemetry, err := u.resolveTelemetryConfig(ctx, c.ID, telemetryAccessKey, telemetrySecretKey)
+	if err != nil {
+		if created {
+			return nil, u.compensateCreatedEdge(ctx, cred.EdgeID, fmt.Errorf("resolve kubernetes telemetry config: %w", err))
+		}
+		return nil, fmt.Errorf("resolve kubernetes telemetry config: %w", err)
+	}
+	if err := u.repo.BindControllerEnrollment(ctx, c.ID, registration, installation, telemetryCredential); err != nil {
 		bindErr := fmt.Errorf("bind k8s controller enrollment: %w", err)
 		if created {
 			return nil, u.compensateCreatedEdge(ctx, cred.EdgeID, bindErr)
 		}
 		return nil, bindErr
 	}
-	return u.enrollResult(c.ID, model.RoleController, mode, cred), nil
+	out := u.enrollResult(c.ID, model.RoleController, mode, cred)
+	out.Telemetry = telemetry
+	return out, nil
+}
+
+func newTelemetryCredential(clusterID uint64) (*model.TelemetryCredential, string, string, error) {
+	accessSuffix, err := randomURLSafe(18)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("generate telemetry access key: %w", err)
+	}
+	secretSuffix, err := randomURLSafe(32)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("generate telemetry secret key: %w", err)
+	}
+	accessKey := "kt_" + accessSuffix
+	secretKey := "ks_" + secretSuffix
+	hash, err := passwd.Hash(secretKey)
+	if err != nil {
+		return nil, "", "", fmt.Errorf("hash telemetry secret key: %w", err)
+	}
+	return &model.TelemetryCredential{
+		ClusterID:     clusterID,
+		AccessKeyID:   accessKey,
+		SecretKeyHash: hash,
+	}, accessKey, secretKey, nil
+}
+
+func (u *Usecase) resolveTelemetryConfig(ctx context.Context, clusterID uint64, accessKey, secretKey string) (*TelemetryConfig, error) {
+	publicURL := strings.TrimRight(strings.TrimSpace(u.cfg.PublicURL), "/")
+	out := &TelemetryConfig{
+		ClusterID: clusterID,
+		AccessKey: accessKey,
+		SecretKey: secretKey,
+	}
+	traces, err := u.resolveTelemetryTarget(ctx, TelemetrySignalTraces, endpointPath(publicURL, "/v1/traces"))
+	if err != nil {
+		return nil, err
+	}
+	logs, err := u.resolveTelemetryTarget(ctx, TelemetrySignalLogs, endpointPath(publicURL, "/loki/api/v1/push"))
+	if err != nil {
+		return nil, err
+	}
+	out.TracesEndpoint = traces.Endpoint
+	out.TracesAuthMode = traces.AuthMode
+	out.TracesBasicUser = traces.BasicUser
+	out.TracesBasicPass = traces.BasicPass
+	out.TracesTLSInsecure = traces.TLSInsecure
+	out.LogsEndpoint = logs.Endpoint
+	out.LogsAuthMode = logs.AuthMode
+	out.LogsBasicUser = logs.BasicUser
+	out.LogsBasicPass = logs.BasicPass
+	out.LogsTLSInsecure = logs.TLSInsecure
+	target := RemoteWriteTarget{
+		Endpoint:               endpointPath(publicURL, "/prometheus/api/v1/write"),
+		UseTelemetryCredential: true,
+	}
+	if u.remoteWrite != nil {
+		resolved, err := u.remoteWrite.ResolveRemoteWrite(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if strings.TrimSpace(resolved.Endpoint) != "" {
+			target = resolved
+		}
+	}
+	out.RemoteWriteEndpoint = strings.TrimSpace(target.Endpoint)
+	out.RemoteWriteTLSInsecure = target.TLSInsecure
+	out.RemoteWriteTLSCAPEM = target.TLSCAPEM
+	if target.UseTelemetryCredential {
+		out.RemoteWriteBasicUser = accessKey
+		out.RemoteWriteBasicPass = secretKey
+	} else {
+		out.RemoteWriteBearer = target.BearerToken
+		out.RemoteWriteBasicUser = target.BasicUser
+		out.RemoteWriteBasicPass = target.BasicPassword
+	}
+	return out, nil
+}
+
+type resolvedTelemetryTarget struct {
+	Endpoint    string
+	AuthMode    string
+	BasicUser   string
+	BasicPass   string
+	TLSInsecure bool
+}
+
+func (u *Usecase) resolveTelemetryTarget(ctx context.Context, signal, fallbackEndpoint string) (resolvedTelemetryTarget, error) {
+	target := TelemetryTarget{
+		Endpoint:               fallbackEndpoint,
+		UseTelemetryCredential: true,
+	}
+	if u.telemetryTargets != nil {
+		resolved, err := u.telemetryTargets.ResolveTelemetryTarget(ctx, signal)
+		if err != nil {
+			return resolvedTelemetryTarget{}, fmt.Errorf("resolve kubernetes %s target: %w", signal, err)
+		}
+		if strings.TrimSpace(resolved.Endpoint) != "" {
+			target = resolved
+		}
+	}
+	out := resolvedTelemetryTarget{
+		Endpoint:    strings.TrimSpace(target.Endpoint),
+		TLSInsecure: target.TLSInsecure,
+	}
+	if target.UseTelemetryCredential {
+		out.AuthMode = telemetryAuthModeTelemetry
+		return out, nil
+	}
+	out.AuthMode = telemetryAuthModeBackend
+	out.BasicUser = strings.TrimSpace(target.BasicUser)
+	out.BasicPass = strings.TrimSpace(target.BasicPassword)
+	if (out.BasicUser == "") != (out.BasicPass == "") {
+		return resolvedTelemetryTarget{}, fmt.Errorf("resolve kubernetes %s target: basic auth requires both username and password", signal)
+	}
+	return out, nil
+}
+
+func endpointPath(base, suffix string) string {
+	if base == "" {
+		return ""
+	}
+	return base + suffix
 }
 
 func (u *Usecase) issueNodeCredential(ctx context.Context, c *model.Cluster, n *model.Node) (*EdgeCredential, bool, error) {
@@ -1934,7 +2202,7 @@ func (u *Usecase) UpgradeCommand(cluster *model.Cluster) string {
 	}
 	args = append(args,
 		"--namespace "+shellQuote(namespace),
-		"--reuse-values",
+		"--reset-then-reuse-values",
 		"--set-string manager.publicURL="+shellQuote(publicURL),
 		"--set-string manager.tunnelAddr="+shellQuote(tunnelAddr),
 		"--set-string manager.tlsInsecure=true",
@@ -1942,6 +2210,12 @@ func (u *Usecase) UpgradeCommand(cluster *model.Cluster) string {
 	if imageTag := strings.TrimSpace(u.cfg.ImageTag); imageTag != "" {
 		args = append(args, "--set-string image.tag="+shellQuote(imageTag))
 	}
+	args = append(args,
+		"--wait",
+		"--wait-for-jobs",
+		"--atomic",
+		"--timeout "+shellQuote("15m"),
+	)
 	return strings.Join(args, " ")
 }
 
