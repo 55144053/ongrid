@@ -91,6 +91,7 @@ type Repository interface {
 	ListEdgeAttachments(ctx context.Context, limit, offset int) ([]EdgeAttachment, int64, error)
 	ListWorkloads(ctx context.Context, f ListWorkloadsFilter) ([]*model.Workload, error)
 	CountWorkloads(ctx context.Context, f ListWorkloadsFilter) (int64, error)
+	ListNamespaceSummaries(ctx context.Context, clusterID uint64) ([]NamespaceSummary, error)
 	ListPods(ctx context.Context, f ListPodsFilter) ([]*model.Pod, error)
 	CountPods(ctx context.Context, f ListPodsFilter) (int64, error)
 	ListEvents(ctx context.Context, f ListEventsFilter) ([]*model.Event, error)
@@ -160,6 +161,16 @@ type ClusterHealthSummary struct {
 	OOMKilledPods        int64
 	ImagePullBackOffPods int64
 	NotReadyNodes        int64
+	Namespaces           []NamespaceSummary
+}
+
+type NamespaceSummary struct {
+	Namespace  string
+	Workloads  int64
+	Pods       int64
+	Events     int64
+	Warnings   int64
+	LastSeenAt *time.Time
 }
 
 type Config struct {
@@ -1011,7 +1022,7 @@ func (u *Usecase) GetClusterHealth(ctx context.Context, clusterID uint64) (Clust
 		return out, err
 	}
 	var err error
-	if out.DegradedWorkloads, err = u.repo.CountWorkloads(ctx, ListWorkloadsFilter{ClusterID: clusterID, IssueOnly: true}); err != nil {
+	if out.DegradedWorkloads, err = u.repo.CountWorkloads(ctx, ListWorkloadsFilter{ClusterID: clusterID, IssueOnly: true, GroupReplicaSets: true}); err != nil {
 		return out, err
 	}
 	if out.PendingPods, err = u.repo.CountPods(ctx, ListPodsFilter{ClusterID: clusterID, Phase: "Pending"}); err != nil {
@@ -1041,7 +1052,57 @@ func (u *Usecase) GetClusterHealth(ctx context.Context, clusterID uint64) (Clust
 			out.NotReadyNodes++
 		}
 	}
+	out.Namespaces, err = u.namespaceSummaries(ctx, clusterID)
+	if err != nil {
+		return out, err
+	}
 	return out, nil
+}
+
+func (u *Usecase) namespaceSummaries(ctx context.Context, clusterID uint64) ([]NamespaceSummary, error) {
+	summaries, err := u.repo.ListNamespaceSummaries(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	byNamespace := make(map[string]*NamespaceSummary, len(summaries))
+	for _, current := range summaries {
+		namespace := strings.TrimSpace(current.Namespace)
+		if namespace == "" {
+			namespace = "default"
+		}
+		current.Namespace = namespace
+		summary := current
+		byNamespace[namespace] = &summary
+	}
+	warnings, err := u.listActionableWarningEvents(ctx, ListEventsFilter{ClusterID: clusterID})
+	if err != nil {
+		return nil, err
+	}
+	for _, event := range warnings {
+		if event == nil {
+			continue
+		}
+		namespace := strings.TrimSpace(eventResourceNamespace(event))
+		if namespace == "" {
+			namespace = "default"
+		}
+		summary := byNamespace[namespace]
+		if summary == nil {
+			summary = &NamespaceSummary{Namespace: namespace}
+			byNamespace[namespace] = summary
+		}
+		summary.Warnings++
+		if occurredAt, ok := warningEventOccurredAt(event); ok && (summary.LastSeenAt == nil || occurredAt.After(*summary.LastSeenAt)) {
+			ts := occurredAt
+			summary.LastSeenAt = &ts
+		}
+	}
+	summaries = summaries[:0]
+	for _, summary := range byNamespace {
+		summaries = append(summaries, *summary)
+	}
+	sort.Slice(summaries, func(i, j int) bool { return summaries[i].Namespace < summaries[j].Namespace })
+	return summaries, nil
 }
 
 func nodeIsNotReady(raw string) bool {
@@ -1689,6 +1750,7 @@ func (u *Usecase) IngestInventory(ctx context.Context, edgeID uint64, in tunnel.
 			ReadyReplicas:     item.ReadyReplicas,
 			ActiveReplicas:    item.ActiveReplicas,
 			FailedReplicas:    item.FailedReplicas,
+			IsTerminalFailure: workloadHasTerminalFailure(item.Conditions),
 			OwnerKind:         strings.TrimSpace(item.OwnerKind),
 			OwnerName:         strings.TrimSpace(item.OwnerName),
 			OwnerUID:          strings.TrimSpace(item.OwnerUID),
@@ -1823,6 +1885,17 @@ func (u *Usecase) IngestInventory(ctx context.Context, edgeID uint64, in tunnel.
 		return nil, err
 	}
 	return result, nil
+}
+
+func workloadHasTerminalFailure(conditions []map[string]string) bool {
+	for _, condition := range conditions {
+		typeName := strings.ToLower(strings.TrimSpace(condition["type"]))
+		status := strings.ToLower(strings.TrimSpace(condition["status"]))
+		if status == "true" && (typeName == "failed" || typeName == "failuretarget") {
+			return true
+		}
+	}
+	return false
 }
 
 const (

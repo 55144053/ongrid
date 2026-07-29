@@ -956,17 +956,32 @@ func TestUsecaseInventoryPersistsWorkloadExecutionCountsAndRolloutMetadata(t *te
 				Revision:          12,
 				CreationTimestamp: &createdAt,
 			},
+			{
+				Kind:            "Job",
+				Namespace:       "jobs",
+				Name:            "terminal-failure",
+				UID:             "terminal-failure-uid",
+				DesiredReplicas: 1,
+				FailedReplicas:  1,
+				Conditions: []map[string]string{{
+					"type":   "FailureTarget",
+					"status": "True",
+				}},
+			},
 		},
 	})
 	if err != nil {
 		t.Fatalf("IngestInventory() error = %v", err)
 	}
-	if len(repo.lastWorkloads) != 2 {
-		t.Fatalf("persisted workloads = %d, want 2", len(repo.lastWorkloads))
+	if len(repo.lastWorkloads) != 3 {
+		t.Fatalf("persisted workloads = %d, want 3", len(repo.lastWorkloads))
 	}
 	got := repo.lastWorkloads[0]
 	if got.ActiveReplicas != 1 || got.FailedReplicas != 1 {
 		t.Fatalf("workload execution = active:%d failed:%d, want 1/1", got.ActiveReplicas, got.FailedReplicas)
+	}
+	if got.IsTerminalFailure {
+		t.Fatalf("retrying job with failed pods must not be terminal: %+v", got)
 	}
 	rs := repo.lastWorkloads[1]
 	if rs.OwnerKind != "Deployment" || rs.OwnerName != "api" || rs.OwnerUID != "deployment-uid" || rs.Revision != 12 {
@@ -974,6 +989,9 @@ func TestUsecaseInventoryPersistsWorkloadExecutionCountsAndRolloutMetadata(t *te
 	}
 	if rs.ResourceCreatedAt == nil || !rs.ResourceCreatedAt.Equal(createdAt) {
 		t.Fatalf("workload resource created at = %v, want %v", rs.ResourceCreatedAt, createdAt)
+	}
+	if !repo.lastWorkloads[2].IsTerminalFailure {
+		t.Fatalf("FailureTarget=True job was not persisted as a terminal failure: %+v", repo.lastWorkloads[2])
 	}
 }
 
@@ -1746,6 +1764,21 @@ func TestUsecaseClusterHealthUsesExactRepositoryCounts(t *testing.T) {
 	repo.pods[podKey(clusterID, "default", "crash", "crash-uid")] = &model.Pod{ClusterID: clusterID, Namespace: "default", Name: "crash", UID: "crash-uid", Phase: "Running", Reason: "CrashLoopBackOff"}
 	repo.pods[podKey(clusterID, "default", "pull", "pull-uid")] = &model.Pod{ClusterID: clusterID, Namespace: "default", Name: "pull", UID: "pull-uid", Phase: "Pending", Reason: "ErrImagePull"}
 	repo.nodes[nodeKey(clusterID, "node-uid")] = &model.Node{ClusterID: clusterID, NodeName: "node-a", NodeUID: "node-uid", ConditionsJSON: `[{"type":"Ready","status":"False"}]`}
+	repo.lastWorkloads = []*model.Workload{
+		{ClusterID: clusterID, Namespace: "default", Kind: "Deployment", Name: "api"},
+		{ClusterID: clusterID, Namespace: "default", Kind: "ReplicaSet", Name: "api-7d8f9", OwnerKind: "Deployment", OwnerName: "api"},
+	}
+	repo.events = []*model.Event{{
+		ClusterID:         clusterID,
+		Namespace:         "default",
+		UID:               "warning-uid",
+		Type:              "Warning",
+		Reason:            "FailedScheduling",
+		InvolvedKind:      "Pod",
+		InvolvedNamespace: "default",
+		InvolvedName:      "pending",
+		InvolvedUID:       "pending-uid",
+	}}
 
 	health, err := uc.GetClusterHealth(ctx, clusterID)
 	if err != nil {
@@ -1753,6 +1786,12 @@ func TestUsecaseClusterHealthUsesExactRepositoryCounts(t *testing.T) {
 	}
 	if health.PendingPods != 2 || health.CrashLoopBackOffPods != 1 || health.ImagePullBackOffPods != 1 || health.NotReadyNodes != 1 {
 		t.Fatalf("health = %+v", health)
+	}
+	if len(repo.countWorkloadFilters) != 1 || !repo.countWorkloadFilters[0].GroupReplicaSets {
+		t.Fatalf("workload health filters = %+v, want grouped ReplicaSets", repo.countWorkloadFilters)
+	}
+	if len(health.Namespaces) != 1 || health.Namespaces[0].Namespace != "default" || health.Namespaces[0].Workloads != 1 || health.Namespaces[0].Pods != 3 || health.Namespaces[0].Events != 1 || health.Namespaces[0].Warnings != 1 {
+		t.Fatalf("namespace health = %+v", health.Namespaces)
 	}
 }
 
@@ -1988,19 +2027,20 @@ func TestActionableWarningEventUntrackedResourceUsesOccurrenceTime(t *testing.T)
 }
 
 type fakeRepo struct {
-	nextClusterID       uint64
-	nextNodeID          uint64
-	clusters            map[uint64]*model.Cluster
-	nodes               map[string]*model.Node
-	deviceNodeIDs       map[uint64]uint64
-	pods                map[string]*model.Pod
-	events              []*model.Event
-	lastWorkloads       []*model.Workload
-	pruned              []string
-	lastInstallation    *model.Installation
-	telemetryCredential *model.TelemetryCredential
-	failUpdateNodeEdge  bool
-	failBindController  bool
+	nextClusterID        uint64
+	nextNodeID           uint64
+	clusters             map[uint64]*model.Cluster
+	nodes                map[string]*model.Node
+	deviceNodeIDs        map[uint64]uint64
+	pods                 map[string]*model.Pod
+	events               []*model.Event
+	lastWorkloads        []*model.Workload
+	countWorkloadFilters []ListWorkloadsFilter
+	pruned               []string
+	lastInstallation     *model.Installation
+	telemetryCredential  *model.TelemetryCredential
+	failUpdateNodeEdge   bool
+	failBindController   bool
 }
 
 func bindFakeController(t *testing.T, repo *fakeRepo, clusterID, edgeID uint64) {
@@ -2681,8 +2721,52 @@ func (r *fakeRepo) ListWorkloads(_ context.Context, _ ListWorkloadsFilter) ([]*m
 }
 
 func (r *fakeRepo) CountWorkloads(ctx context.Context, f ListWorkloadsFilter) (int64, error) {
+	r.countWorkloadFilters = append(r.countWorkloadFilters, f)
 	items, err := r.ListWorkloads(ctx, f)
 	return int64(len(items)), err
+}
+
+func (r *fakeRepo) ListNamespaceSummaries(_ context.Context, clusterID uint64) ([]NamespaceSummary, error) {
+	byNamespace := map[string]*NamespaceSummary{}
+	ensure := func(namespace string) *NamespaceSummary {
+		namespace = strings.TrimSpace(namespace)
+		if namespace == "" {
+			namespace = "default"
+		}
+		if summary := byNamespace[namespace]; summary != nil {
+			return summary
+		}
+		summary := &NamespaceSummary{Namespace: namespace}
+		byNamespace[namespace] = summary
+		return summary
+	}
+	for _, item := range r.lastWorkloads {
+		if item == nil || item.ClusterID != clusterID || (item.Kind == "ReplicaSet" && item.OwnerKind == "Deployment" && (item.OwnerUID != "" || item.OwnerName != "")) {
+			continue
+		}
+		ensure(item.Namespace).Workloads++
+	}
+	for _, item := range r.pods {
+		if item != nil && item.ClusterID == clusterID {
+			ensure(item.Namespace).Pods++
+		}
+	}
+	for _, item := range r.events {
+		if item == nil || item.ClusterID != clusterID {
+			continue
+		}
+		namespace := item.Namespace
+		if strings.TrimSpace(namespace) == "" {
+			namespace = item.InvolvedNamespace
+		}
+		ensure(namespace).Events++
+	}
+	out := make([]NamespaceSummary, 0, len(byNamespace))
+	for _, summary := range byNamespace {
+		out = append(out, *summary)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Namespace < out[j].Namespace })
+	return out, nil
 }
 
 func (r *fakeRepo) ListPods(_ context.Context, f ListPodsFilter) ([]*model.Pod, error) {

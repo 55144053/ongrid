@@ -89,6 +89,7 @@ type Workload struct {
 	ReadyReplicas     int        `gorm:"not null;default:0;column:ready_replicas"`
 	ActiveReplicas    int        `gorm:"not null;default:0;column:active_replicas"`
 	FailedReplicas    int        `gorm:"not null;default:0;column:failed_replicas"`
+	IsTerminalFailure bool       `gorm:"not null;default:false;column:is_terminal_failure"`
 	OwnerKind         string     `gorm:"size:64;not null;default:'';column:owner_kind;index:idx_k8s_workloads_owner,priority:2"`
 	OwnerName         string     `gorm:"size:255;not null;default:'';column:owner_name"`
 	OwnerUID          string     `gorm:"size:128;not null;default:'';column:owner_uid;index:idx_k8s_workloads_owner,priority:3"`

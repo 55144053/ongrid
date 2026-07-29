@@ -118,6 +118,7 @@ func (h *Handler) getClusterHealth(w http.ResponseWriter, r *http.Request) {
 		OOMKilledPods:        out.OOMKilledPods,
 		ImagePullBackOffPods: out.ImagePullBackOffPods,
 		NotReadyNodes:        out.NotReadyNodes,
+		Namespaces:           namespaceSummaryDTOs(out.Namespaces),
 	})
 }
 
@@ -596,12 +597,37 @@ type clusterRegistrationDTO struct {
 }
 
 type clusterHealthDTO struct {
-	DegradedWorkloads    int64 `json:"degraded_workloads"`
-	PendingPods          int64 `json:"pending_pods"`
-	CrashLoopBackOffPods int64 `json:"crash_loop_back_off_pods"`
-	OOMKilledPods        int64 `json:"oom_killed_pods"`
-	ImagePullBackOffPods int64 `json:"image_pull_back_off_pods"`
-	NotReadyNodes        int64 `json:"not_ready_nodes"`
+	DegradedWorkloads    int64                 `json:"degraded_workloads"`
+	PendingPods          int64                 `json:"pending_pods"`
+	CrashLoopBackOffPods int64                 `json:"crash_loop_back_off_pods"`
+	OOMKilledPods        int64                 `json:"oom_killed_pods"`
+	ImagePullBackOffPods int64                 `json:"image_pull_back_off_pods"`
+	NotReadyNodes        int64                 `json:"not_ready_nodes"`
+	Namespaces           []namespaceSummaryDTO `json:"namespaces"`
+}
+
+type namespaceSummaryDTO struct {
+	Namespace  string     `json:"namespace"`
+	Workloads  int64      `json:"workloads"`
+	Pods       int64      `json:"pods"`
+	Events     int64      `json:"events"`
+	Warnings   int64      `json:"warnings"`
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+}
+
+func namespaceSummaryDTOs(items []biz.NamespaceSummary) []namespaceSummaryDTO {
+	out := make([]namespaceSummaryDTO, 0, len(items))
+	for _, item := range items {
+		out = append(out, namespaceSummaryDTO{
+			Namespace:  item.Namespace,
+			Workloads:  item.Workloads,
+			Pods:       item.Pods,
+			Events:     item.Events,
+			Warnings:   item.Warnings,
+			LastSeenAt: item.LastSeenAt,
+		})
+	}
+	return out
 }
 
 type edgeAttachmentDTO struct {

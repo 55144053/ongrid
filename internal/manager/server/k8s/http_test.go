@@ -145,6 +145,22 @@ func TestWorkloadDTOFromModelIncludesExecutionCounts(t *testing.T) {
 	}
 }
 
+func TestNamespaceSummaryDTOsPreservesClusterWideCounts(t *testing.T) {
+	now := time.Now().UTC()
+	items := namespaceSummaryDTOs([]biz.NamespaceSummary{{
+		Namespace:  "late-page",
+		Workloads:  1,
+		Pods:       1400,
+		Events:     12,
+		Warnings:   2,
+		LastSeenAt: &now,
+	}})
+
+	if len(items) != 1 || items[0].Namespace != "late-page" || items[0].Workloads != 1 || items[0].Pods != 1400 || items[0].Events != 12 || items[0].Warnings != 2 || items[0].LastSeenAt == nil {
+		t.Fatalf("namespace summary DTOs = %+v", items)
+	}
+}
+
 func TestListWorkloadsUsesOffsetAndReturnsGroupedReplicaSetVersions(t *testing.T) {
 	svc := &workloadPageService{}
 	h := NewHandler(svc)

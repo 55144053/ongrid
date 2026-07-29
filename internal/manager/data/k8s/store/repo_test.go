@@ -251,12 +251,13 @@ func TestRepo_SnapshotUpsertsWorkOnSQLite(t *testing.T) {
 	workload.ReadyReplicas = 1
 	workload.ActiveReplicas = 0
 	workload.FailedReplicas = 1
+	workload.IsTerminalFailure = true
 	workload.LastSeenAt = &secondSeen
 	if err := repo.UpsertWorkloads(ctx, []*model.Workload{workload}); err != nil {
 		t.Fatalf("UpsertWorkloads(second): %v", err)
 	}
 	workloads, err := repo.ListWorkloads(ctx, biz.ListWorkloadsFilter{ClusterID: 1})
-	if err != nil || len(workloads) != 1 || workloads[0].UID != "workload-v2" || workloads[0].ReadyReplicas != 1 || workloads[0].ActiveReplicas != 0 || workloads[0].FailedReplicas != 1 {
+	if err != nil || len(workloads) != 1 || workloads[0].UID != "workload-v2" || workloads[0].ReadyReplicas != 1 || workloads[0].ActiveReplicas != 0 || workloads[0].FailedReplicas != 1 || !workloads[0].IsTerminalFailure {
 		t.Fatalf("workload upsert result=%+v err=%v", workloads, err)
 	}
 
@@ -325,17 +326,32 @@ func TestRepo_ListWorkloadsSupportsQueryAndIssueOnly(t *testing.T) {
 			LastSeenAt:      &now,
 		},
 		{
+			ClusterID:         1,
+			Namespace:         "jobs",
+			Kind:              "Job",
+			Name:              "failed-job",
+			UID:               "job-failed",
+			DesiredReplicas:   1,
+			ReadyReplicas:     0,
+			FailedReplicas:    1,
+			IsTerminalFailure: true,
+			LabelsJSON:        "{}",
+			AnnotationsJSON:   "{}",
+			ConditionsJSON:    `[{"type":"Failed","status":"True"}]`,
+			LastSeenAt:        &now,
+		},
+		{
 			ClusterID:       1,
 			Namespace:       "jobs",
 			Kind:            "Job",
-			Name:            "failed-job",
-			UID:             "job-failed",
+			Name:            "retrying-job",
+			UID:             "job-retrying",
 			DesiredReplicas: 1,
 			ReadyReplicas:   0,
 			FailedReplicas:  1,
 			LabelsJSON:      "{}",
 			AnnotationsJSON: "{}",
-			ConditionsJSON:  `[{"type":"Failed","status":"True"}]`,
+			ConditionsJSON:  "[]",
 			LastSeenAt:      &now,
 		},
 		{
@@ -471,8 +487,8 @@ func TestRepo_ListWorkloadsSupportsQueryAndIssueOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListWorkloads(group replica sets): %v", err)
 	}
-	if len(visible) != 6 {
-		t.Fatalf("visible workloads=%d want 6", len(visible))
+	if len(visible) != 7 {
+		t.Fatalf("visible workloads=%d want 7", len(visible))
 	}
 	for _, item := range visible {
 		if item.Name == "checkout-api-history" || item.Name == "checkout-api-current" {
@@ -486,8 +502,8 @@ func TestRepo_ListWorkloadsSupportsQueryAndIssueOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CountWorkloads(group replica sets): %v", err)
 	}
-	if visibleTotal != 6 {
-		t.Fatalf("visible total=%d want 6", visibleTotal)
+	if visibleTotal != 7 {
+		t.Fatalf("visible total=%d want 7", visibleTotal)
 	}
 
 	ownerFilter := biz.ListWorkloadsFilter{
@@ -525,6 +541,54 @@ func TestRepo_ListWorkloadsSupportsQueryAndIssueOnly(t *testing.T) {
 	parentTotal, err := repo.CountWorkloads(context.Background(), childQueryFilter)
 	if err != nil || parentTotal != 1 {
 		t.Fatalf("grouped child query total=%d err=%v, want 1", parentTotal, err)
+	}
+}
+
+func TestRepo_ListNamespaceSummariesAggregatesAllGroupedResources(t *testing.T) {
+	db, repo := newTestRepo(t)
+	now := time.Now().UTC()
+	workloads := []*model.Workload{
+		{ClusterID: 1, Namespace: "apps", Kind: "Deployment", Name: "api", UID: "deployment-uid", LabelsJSON: "{}", AnnotationsJSON: "{}", ConditionsJSON: "[]", LastSeenAt: &now},
+		{ClusterID: 1, Namespace: "apps", Kind: "ReplicaSet", Name: "api-7d8f9", UID: "rs-uid", OwnerKind: "Deployment", OwnerName: "api", OwnerUID: "deployment-uid", LabelsJSON: "{}", AnnotationsJSON: "{}", ConditionsJSON: "[]", LastSeenAt: &now},
+		{ClusterID: 1, Namespace: "jobs", Kind: "CronJob", Name: "cleanup", UID: "cronjob-uid", LabelsJSON: "{}", AnnotationsJSON: "{}", ConditionsJSON: "[]", LastSeenAt: &now},
+	}
+	pods := []*model.Pod{
+		{ClusterID: 1, Namespace: "apps", Name: "api-1", UID: "pod-apps", LastSeenAt: &now},
+		{ClusterID: 1, Namespace: "late-page", Name: "worker-1500", UID: "pod-late", LastSeenAt: &now},
+	}
+	events := []*model.Event{
+		{ClusterID: 1, Namespace: "apps", Name: "scheduled", UID: "event-apps", LastSeenAt: &now},
+		{ClusterID: 1, Namespace: "", Name: "late-warning", UID: "event-late", InvolvedNamespace: "late-page", LastSeenAt: &now},
+	}
+	if err := db.Create(&workloads).Error; err != nil {
+		t.Fatalf("Create workloads: %v", err)
+	}
+	if err := db.Create(&pods).Error; err != nil {
+		t.Fatalf("Create pods: %v", err)
+	}
+	if err := db.Create(&events).Error; err != nil {
+		t.Fatalf("Create events: %v", err)
+	}
+
+	summaries, err := repo.ListNamespaceSummaries(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("ListNamespaceSummaries: %v", err)
+	}
+	if len(summaries) != 3 {
+		t.Fatalf("namespace summaries = %+v, want 3 namespaces", summaries)
+	}
+	byNamespace := make(map[string]biz.NamespaceSummary, len(summaries))
+	for _, summary := range summaries {
+		byNamespace[summary.Namespace] = summary
+	}
+	if got := byNamespace["apps"]; got.Workloads != 1 || got.Pods != 1 || got.Events != 1 || got.LastSeenAt == nil {
+		t.Fatalf("apps summary = %+v", got)
+	}
+	if got := byNamespace["jobs"]; got.Workloads != 1 || got.Pods != 0 || got.Events != 0 {
+		t.Fatalf("jobs summary = %+v", got)
+	}
+	if got := byNamespace["late-page"]; got.Workloads != 0 || got.Pods != 1 || got.Events != 1 {
+		t.Fatalf("late-page summary = %+v", got)
 	}
 }
 

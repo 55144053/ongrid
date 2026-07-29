@@ -135,6 +135,16 @@ export type KubernetesClusterHealth = {
   oom_killed_pods: number;
   image_pull_back_off_pods: number;
   not_ready_nodes: number;
+  namespaces?: KubernetesNamespaceSummary[];
+};
+
+export type KubernetesNamespaceSummary = {
+  namespace: string;
+  workloads: number;
+  pods: number;
+  events: number;
+  warnings: number;
+  last_seen_at?: string | null;
 };
 
 export type KubernetesEdgeAttachment = {

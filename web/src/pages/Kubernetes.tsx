@@ -331,8 +331,11 @@ export function KubernetesClusterDetailPage() {
   const detailTabs = useMemo(() => detailTabsForCluster(cluster), [cluster]);
   const awaitingConnection = isClusterAwaitingConnection(cluster);
   const [nodes, setNodes] = useState<KubernetesNode[]>([]);
+  const [issueNodes, setIssueNodes] = useState<KubernetesNode[]>([]);
   const [workloads, setWorkloads] = useState<KubernetesWorkload[]>([]);
+  const [issueWorkloads, setIssueWorkloads] = useState<KubernetesWorkload[]>([]);
   const [pods, setPods] = useState<KubernetesPod[]>([]);
+  const [issuePods, setIssuePods] = useState<KubernetesPod[]>([]);
   const [crashLoopPods, setCrashLoopPods] = useState<KubernetesPod[]>([]);
   const [events, setEvents] = useState<KubernetesEvent[]>([]);
   const [warningEvents, setWarningEvents] = useState<KubernetesEvent[]>([]);
@@ -342,6 +345,7 @@ export function KubernetesClusterDetailPage() {
   const [actionProposalTotal, setActionProposalTotal] = useState(0);
   const [actionAuditError, setActionAuditError] = useState<string | null>(null);
   const [totals, setTotals] = useState<ResourceTotals>({ nodes: 0, workloads: 0, pods: 0, events: 0 });
+  const [issueResourceTotals, setIssueResourceTotals] = useState({ nodes: 0, workloads: 0, pods: 0 });
   const [crashLoopTotal, setCrashLoopTotal] = useState(0);
   const [healthSummary, setHealthSummary] = useState<KubernetesClusterHealth | null>(null);
   const [loading, setLoading] = useState(true);
@@ -381,12 +385,29 @@ export function KubernetesClusterDetailPage() {
         : listEdges()
           .then((out) => buildEdgeVersionMap(out.items ?? []))
           .catch(() => ({}));
-      const [clusterOut, healthOut, nodesOut, workloadsOut, podsOut, crashLoopPodsOut, eventsOut, warningEventsOut, auditOut, edgeVersionMap] = await Promise.all([
+      const [
+        clusterOut,
+        healthOut,
+        nodesOut,
+        issueNodesOut,
+        workloadsOut,
+        issueWorkloadsOut,
+        podsOut,
+        issuePodsOut,
+        crashLoopPodsOut,
+        eventsOut,
+        warningEventsOut,
+        auditOut,
+        edgeVersionMap,
+      ] = await Promise.all([
         getKubernetesCluster(clusterId),
         getKubernetesClusterHealth(clusterId),
         listKubernetesNodes(clusterId, { limit: RESOURCE_PAGE_SIZE }),
+        listKubernetesNodes(clusterId, { issue_only: true, limit: RESOURCE_PAGE_SIZE }),
         listKubernetesWorkloads(clusterId, { group_replica_sets: true, limit: RESOURCE_PAGE_SIZE }),
+        listKubernetesWorkloads(clusterId, { issue_only: true, group_replica_sets: true, limit: RESOURCE_PAGE_SIZE }),
         listKubernetesPods(clusterId, { limit: RESOURCE_PAGE_SIZE }),
+        listKubernetesPods(clusterId, { issue_only: true, limit: RESOURCE_PAGE_SIZE }),
         listKubernetesPods(clusterId, { reason: 'CrashLoopBackOff', limit: 20 }),
         listKubernetesEvents(clusterId, { limit: RESOURCE_PAGE_SIZE }),
         listKubernetesEvents(clusterId, { issue_only: true, limit: 100 }),
@@ -396,8 +417,11 @@ export function KubernetesClusterDetailPage() {
       setCluster(clusterOut);
       setHealthSummary(healthOut);
       setNodes(nodesOut.items ?? []);
+      setIssueNodes(issueNodesOut.items ?? []);
       setWorkloads(workloadsOut.items ?? []);
+      setIssueWorkloads(issueWorkloadsOut.items ?? []);
       setPods(podsOut.items ?? []);
+      setIssuePods(issuePodsOut.items ?? []);
       setCrashLoopPods(crashLoopPodsOut.items ?? []);
       setEvents(eventsOut.items ?? []);
       const visibleWorkloadsTotal = workloadsOut.total ?? (workloadsOut.items?.length ?? 0);
@@ -411,6 +435,11 @@ export function KubernetesClusterDetailPage() {
         workloads: visibleWorkloadsTotal,
         pods: podsOut.total ?? (podsOut.items?.length ?? 0),
         events: eventsOut.total ?? (eventsOut.items?.length ?? 0),
+      });
+      setIssueResourceTotals({
+        nodes: issueNodesOut.total ?? (issueNodesOut.items?.length ?? 0),
+        workloads: issueWorkloadsOut.total ?? (issueWorkloadsOut.items?.length ?? 0),
+        pods: issuePodsOut.total ?? (issuePodsOut.items?.length ?? 0),
       });
       setCrashLoopTotal(crashLoopPodsOut.total ?? (crashLoopPodsOut.items?.length ?? 0));
       setResourceFilterRefreshNonce((value) => value + 1);
@@ -447,7 +476,11 @@ export function KubernetesClusterDetailPage() {
   }, [refresh]);
   usePoll(() => refresh({ silent: true }), POLL_INTERVAL_MS);
 
-  const namespaces = useMemo(() => collectNamespaces(workloads, pods, events), [workloads, pods, events]);
+  const namespaceRows = useMemo(
+    () => buildNamespaceRows(workloads, pods, events, warningEvents, healthSummary?.namespaces),
+    [events, healthSummary?.namespaces, pods, warningEvents, workloads],
+  );
+  const namespaces = useMemo(() => namespaceRows.map((row) => row.namespace), [namespaceRows]);
   const actionTypeOptions = useMemo(() => collectActionTypes(actionProposals), [actionProposals]);
   const resourceFilters = useMemo(
     () => ({
@@ -651,7 +684,6 @@ export function KubernetesClusterDetailPage() {
     const lastPage = Math.max(1, Math.ceil(activePaginatedTotal / RESOURCE_PAGE_SIZE));
     setResourcePage((current) => Math.min(current, lastPage));
   }, [activePaginatedTotal, activeTabSupportsServerFilter, needsServerResourceFetch, serverResourceActive]);
-  const namespaceRows = useMemo(() => buildNamespaceRows(workloads, pods, events, warningEvents), [events, pods, warningEvents, workloads]);
   const filteredNamespaceRows = useMemo(() => filterNamespaceRows(namespaceRows, localResourceFilters), [localResourceFilters, namespaceRows]);
   const filteredActionProposals = useMemo(() => filterActionProposals(actionProposals, localResourceFilters), [actionProposals, localResourceFilters]);
   const resourceFilterHint = useMemo(() => resourceFilterSummary(localResourceFilters, activeTab, tr), [activeTab, localResourceFilters, tr]);
@@ -665,12 +697,12 @@ export function KubernetesClusterDetailPage() {
     return { linked: coverage.edge_linked, total: coverage.total, pct: coverage.percent };
   }, [cluster?.node_edge_coverage]);
   const triageIssues = useMemo(
-    () => buildTriageIssues({ cluster, nodes: visibleNodes, workloads, pods, crashLoopPods, warningEvents, tr }),
-    [cluster, crashLoopPods, pods, tr, visibleNodes, warningEvents, workloads],
+    () => buildTriageIssues({ cluster, nodes: issueNodes, workloads: issueWorkloads, pods: issuePods, crashLoopPods, warningEvents, tr }),
+    [cluster, crashLoopPods, issueNodes, issuePods, issueWorkloads, tr, warningEvents],
   );
   const writeActionRecommendations = useMemo(
-    () => buildWriteActionRecommendations({ nodes: visibleNodes, workloads, pods, crashLoopPods, warningEvents, tr }),
-    [crashLoopPods, pods, tr, visibleNodes, warningEvents, workloads],
+    () => buildWriteActionRecommendations({ nodes: issueNodes, workloads: issueWorkloads, pods: issuePods, crashLoopPods, warningEvents, tr }),
+    [crashLoopPods, issueNodes, issuePods, issueWorkloads, tr, warningEvents],
   );
 
   const openResourceTab = useCallback((tab: DetailTab, opts?: { scroll?: boolean; resetFilters?: boolean }) => {
@@ -922,15 +954,11 @@ export function KubernetesClusterDetailPage() {
                 <ResourceViewHeader
                   activeTab={activeTab}
                   totals={totals}
-                  nodes={visibleNodes}
-                  workloads={workloads}
-                  pods={pods}
-                  crashLoopPods={crashLoopPods}
+                  issueTotals={issueResourceTotals}
                   crashLoopTotal={crashLoopTotal}
-                  events={events}
-                  warningEvents={warningEvents}
                   warningEventTotal={warningEventTotal}
                   namespaces={namespaces}
+                  namespaceRows={namespaceRows}
                   actionProposals={actionProposals}
                   actionProposalTotal={actionProposalTotal}
                   edgeAccess={edgeAccess}
@@ -2604,15 +2632,11 @@ type ServerFilteredResources = {
 function ResourceViewHeader({
   activeTab,
   totals,
-  nodes,
-  workloads,
-  pods,
-  crashLoopPods,
+  issueTotals,
   crashLoopTotal,
-  events,
-  warningEvents,
   warningEventTotal,
   namespaces,
+  namespaceRows,
   actionProposals,
   actionProposalTotal,
   edgeAccess,
@@ -2620,26 +2644,22 @@ function ResourceViewHeader({
 }: {
   activeTab: DetailTab;
   totals: ResourceTotals;
-  nodes: KubernetesNode[];
-  workloads: KubernetesWorkload[];
-  pods: KubernetesPod[];
-  crashLoopPods: KubernetesPod[];
+  issueTotals: { nodes: number; workloads: number; pods: number };
   crashLoopTotal: number;
-  events: KubernetesEvent[];
-  warningEvents: KubernetesEvent[];
   warningEventTotal: number;
   namespaces: string[];
+  namespaceRows: NamespaceRow[];
   actionProposals: MutatingProposal[];
   actionProposalTotal: number;
   edgeAccess: { linked: number; total: number; pct: number } | null;
   onOpenTab(tab: DetailTab): void;
 }) {
   const { tr } = useI18n();
-  const degradedWorkloads = workloads.filter(isDegradedWorkload).length;
-  const abnormalPods = buildAbnormalPods(pods, crashLoopPods).length;
-  const nodeIssues = buildNodeIssues(nodes).length;
+  const degradedWorkloads = issueTotals.workloads;
+  const abnormalPods = issueTotals.pods;
+  const nodeIssues = issueTotals.nodes;
   const missingEdgeNodes = edgeAccess ? edgeAccess.total - edgeAccess.linked : 0;
-  const namespaceWarnings = buildNamespaceRows(workloads, pods, events, warningEvents).filter((row) => row.warnings > 0).length;
+  const namespaceWarnings = namespaceRows.filter((row) => row.warnings > 0).length;
   const pendingActions = actionProposals.filter((item) => (item.decision || '').toLowerCase() === 'pending').length;
   const context = resourceViewContext({
     activeTab,
@@ -4259,18 +4279,6 @@ function matchesQuery(query: string, ...parts: unknown[]) {
     .includes(query);
 }
 
-function collectNamespaces(
-  workloads: KubernetesWorkload[],
-  pods: KubernetesPod[],
-  events: KubernetesEvent[],
-) {
-  const set = new Set<string>();
-  for (const item of workloads) if (item.namespace) set.add(item.namespace);
-  for (const item of pods) if (item.namespace) set.add(item.namespace);
-  for (const item of events) if (item.namespace) set.add(item.namespace);
-  return [...set].sort();
-}
-
 function buildIssueCounts(
   nodes: KubernetesNode[],
   pods: KubernetesPod[],
@@ -4416,10 +4424,7 @@ const JOB_COMPLETE_CONDITION_TYPES = new Set(['complete', 'successcriteriamet'])
 function workloadHealthState(item: KubernetesWorkload): WorkloadHealthState {
   const kind = item.kind.trim().toLowerCase();
   if (kind === 'job') {
-    if (
-      workloadHasTrueCondition(item, JOB_FAILED_CONDITION_TYPES) ||
-      ((item.failed_replicas ?? 0) > 0 && (item.active_replicas ?? 0) === 0 && item.ready_replicas < item.desired_replicas)
-    ) {
+    if (workloadHasTrueCondition(item, JOB_FAILED_CONDITION_TYPES)) {
       return 'failed';
     }
     if (
@@ -4754,7 +4759,20 @@ function buildNamespaceRows(
   pods: KubernetesPod[],
   events: KubernetesEvent[],
   warningEvents: KubernetesEvent[],
+  summaries?: KubernetesClusterHealth['namespaces'],
 ): NamespaceRow[] {
+  if (summaries !== undefined) {
+    return summaries
+      .map((summary) => ({
+        namespace: summary.namespace || 'default',
+        workloads: summary.workloads,
+        pods: summary.pods,
+        events: summary.events,
+        warnings: summary.warnings,
+        lastSeenAt: summary.last_seen_at ?? null,
+      }))
+      .sort((a, b) => a.namespace.localeCompare(b.namespace));
+  }
   const rows = new Map<string, NamespaceRow>();
   const ensure = (namespace: string) => {
     const key = namespace || 'default';

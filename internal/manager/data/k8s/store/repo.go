@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -534,6 +536,7 @@ func (r *Repo) UpsertWorkloads(ctx context.Context, items []*model.Workload) err
 			"ready_replicas",
 			"active_replicas",
 			"failed_replicas",
+			"is_terminal_failure",
 			"owner_kind",
 			"owner_name",
 			"owner_uid",
@@ -920,6 +923,112 @@ func (r *Repo) CountWorkloads(ctx context.Context, f biz.ListWorkloadsFilter) (i
 	return total, nil
 }
 
+func (r *Repo) ListNamespaceSummaries(ctx context.Context, clusterID uint64) ([]biz.NamespaceSummary, error) {
+	type resourceCountRow struct {
+		Namespace  string
+		Total      int64
+		LastSeenAt sql.NullString
+	}
+	type eventCountRow struct {
+		Namespace         string
+		InvolvedNamespace string
+		Total             int64
+		LastSeenAt        sql.NullString
+	}
+
+	byNamespace := make(map[string]*biz.NamespaceSummary)
+	ensure := func(namespace string) *biz.NamespaceSummary {
+		namespace = strings.TrimSpace(namespace)
+		if namespace == "" {
+			namespace = "default"
+		}
+		if summary := byNamespace[namespace]; summary != nil {
+			return summary
+		}
+		summary := &biz.NamespaceSummary{Namespace: namespace}
+		byNamespace[namespace] = summary
+		return summary
+	}
+	touch := func(summary *biz.NamespaceSummary, rawLastSeenAt sql.NullString) {
+		if !rawLastSeenAt.Valid {
+			return
+		}
+		lastSeenAt := parseAggregateTime(rawLastSeenAt.String)
+		if lastSeenAt == nil || (summary.LastSeenAt != nil && !lastSeenAt.After(*summary.LastSeenAt)) {
+			return
+		}
+		ts := *lastSeenAt
+		summary.LastSeenAt = &ts
+	}
+
+	var workloads []resourceCountRow
+	if err := applyWorkloadFilter(
+		r.db.WithContext(ctx).Model(&model.Workload{}),
+		biz.ListWorkloadsFilter{ClusterID: clusterID, GroupReplicaSets: true},
+	).Select("namespace, COUNT(*) AS total, CAST(MAX(last_seen_at) AS CHAR) AS last_seen_at").
+		Group("namespace").Scan(&workloads).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range workloads {
+		summary := ensure(row.Namespace)
+		summary.Workloads += row.Total
+		touch(summary, row.LastSeenAt)
+	}
+
+	var pods []resourceCountRow
+	if err := r.db.WithContext(ctx).Model(&model.Pod{}).
+		Where("cluster_id = ?", clusterID).
+		Select("namespace, COUNT(*) AS total, CAST(MAX(last_seen_at) AS CHAR) AS last_seen_at").
+		Group("namespace").Scan(&pods).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range pods {
+		summary := ensure(row.Namespace)
+		summary.Pods += row.Total
+		touch(summary, row.LastSeenAt)
+	}
+
+	var events []eventCountRow
+	if err := r.db.WithContext(ctx).Model(&model.Event{}).
+		Where("cluster_id = ?", clusterID).
+		Select("namespace, involved_namespace, COUNT(*) AS total, CAST(MAX(last_seen_at) AS CHAR) AS last_seen_at").
+		Group("namespace, involved_namespace").Scan(&events).Error; err != nil {
+		return nil, err
+	}
+	for _, row := range events {
+		namespace := row.Namespace
+		if strings.TrimSpace(namespace) == "" {
+			namespace = row.InvolvedNamespace
+		}
+		summary := ensure(namespace)
+		summary.Events += row.Total
+		touch(summary, row.LastSeenAt)
+	}
+
+	out := make([]biz.NamespaceSummary, 0, len(byNamespace))
+	for _, summary := range byNamespace {
+		out = append(out, *summary)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Namespace < out[j].Namespace })
+	return out, nil
+}
+
+func parseAggregateTime(value string) *time.Time {
+	value = strings.TrimSpace(value)
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05",
+	} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return &parsed
+		}
+	}
+	return nil
+}
+
 func (r *Repo) ListPods(ctx context.Context, f biz.ListPodsFilter) ([]*model.Pod, error) {
 	tx := applyPodFilter(r.db.WithContext(ctx).Model(&model.Pod{}), f)
 	if f.Limit > 0 {
@@ -998,8 +1107,8 @@ func applyWorkloadFilter(tx *gorm.DB, f biz.ListWorkloadsFilter) *gorm.DB {
 		tx = tx.Where(`
 			(LOWER(kind) <> ? AND ready_replicas < desired_replicas)
 			OR
-			(LOWER(kind) = ? AND ready_replicas < desired_replicas AND active_replicas = 0 AND failed_replicas > 0)
-		`, "job", "job")
+			(LOWER(kind) = ? AND is_terminal_failure = ?)
+		`, "job", "job", true)
 	}
 	if f.GroupReplicaSets {
 		tx = tx.Where("NOT (kind = ? AND owner_kind = ? AND (owner_uid <> ? OR owner_name <> ?))", "ReplicaSet", "Deployment", "", "")

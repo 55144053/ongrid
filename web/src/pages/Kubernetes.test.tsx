@@ -430,6 +430,13 @@ describe('KubernetesPage', () => {
       conditions: [{ type: 'Failed', status: 'True', reason: 'BackoffLimitExceeded' }],
       last_seen_at: new Date().toISOString(),
     };
+    const retryingJob = {
+      ...failedJob,
+      id: 54,
+      name: 'schema-job-retrying',
+      failed_replicas: 1,
+      conditions: [],
+    };
     const failedJobPod = {
       id: 53,
       cluster_id: 1,
@@ -460,7 +467,7 @@ describe('KubernetesPage', () => {
         if (issueOnly) issueOnlyRequests += 1;
         const items = issueOnly
           ? includeFailedJob ? [failedJob] : []
-          : includeFailedJob ? [activeJob, failedJob] : [activeJob];
+          : includeFailedJob ? [activeJob, retryingJob, failedJob] : [activeJob, retryingJob];
         return HttpResponse.json({ items, total: items.length, limit: 100, offset: 0 });
       }),
       http.get('/api/v1/k8s/clusters/:id/pods', ({ request }) => {
@@ -481,11 +488,18 @@ describe('KubernetesPage', () => {
     expect(within(activeRow as HTMLElement).getByText('运行中')).toBeInTheDocument();
     expect(within(activeRow as HTMLElement).getByText('0/1 完成 · 1 运行')).toBeInTheDocument();
 
+    const retryingCell = screen.getByText('schema-job-retrying');
+    const retryingRow = retryingCell.closest('tr');
+    expect(retryingRow).not.toBeNull();
+    expect(within(retryingRow as HTMLElement).getByText('等待中')).toBeInTheDocument();
+    expect(within(retryingRow as HTMLElement).getByText('0/1 完成 · 1 失败')).toBeInTheDocument();
+
     const failedCell = screen.getByText('schema-job-failed');
     const failedRow = failedCell.closest('tr');
     expect(failedRow).not.toBeNull();
     expect(within(failedRow as HTMLElement).getByText('失败')).toBeInTheDocument();
     expect(screen.queryByText('Job/schema-job-active')).not.toBeInTheDocument();
+    expect(screen.queryByText('Job/schema-job-retrying')).not.toBeInTheDocument();
     expect(screen.getByText('Job/schema-job-failed')).toBeInTheDocument();
     expect(screen.getByText('1 个待确认问题')).toBeInTheDocument();
 
@@ -503,6 +517,63 @@ describe('KubernetesPage', () => {
       expect(issueOnlyRequests).toBeGreaterThan(issueOnlyRequestsBeforeRefresh);
       expect(screen.queryByText('schema-job-failed')).not.toBeInTheDocument();
     });
+  });
+
+  it('集群级异常和 Namespace 汇总不受首屏 100 条限制', async () => {
+    const lateWorkload = {
+      id: 1501,
+      cluster_id: 1,
+      namespace: 'late-page',
+      kind: 'Deployment',
+      name: 'late-api',
+      uid: 'late-api-uid',
+      desired_replicas: 3,
+      ready_replicas: 1,
+      conditions: [],
+      last_seen_at: new Date().toISOString(),
+    };
+    server.use(
+      http.get('/api/v1/k8s/clusters/:id/health', () => HttpResponse.json({
+        degraded_workloads: 1,
+        pending_pods: 0,
+        crash_loop_back_off_pods: 0,
+        oom_killed_pods: 0,
+        image_pull_back_off_pods: 0,
+        not_ready_nodes: 0,
+        namespaces: [
+          { namespace: 'first-page', workloads: 100, pods: 100, events: 100, warnings: 0 },
+          { namespace: 'late-page', workloads: 1, pods: 1400, events: 12, warnings: 0 },
+        ],
+      })),
+      http.get('/api/v1/k8s/clusters/:id/workloads', ({ request }) => {
+        const issueOnly = new URL(request.url).searchParams.get('issue_only') === 'true';
+        if (issueOnly) return HttpResponse.json({ items: [lateWorkload], total: 1, limit: 100, offset: 0 });
+        return HttpResponse.json({
+          items: [{ ...lateWorkload, id: 1, namespace: 'first-page', name: 'healthy-api', ready_replicas: 3 }],
+          total: 1501,
+          limit: 100,
+          offset: 0,
+        });
+      }),
+      http.get('/api/v1/k8s/clusters/:id/pods', ({ request }) => {
+        const url = new URL(request.url);
+        if (url.searchParams.get('reason') === 'CrashLoopBackOff' || url.searchParams.get('issue_only') === 'true') {
+          return HttpResponse.json({ items: [], total: 0, limit: 100, offset: 0 });
+        }
+        return HttpResponse.json({ items: [], total: 1500, limit: 100, offset: 0 });
+      }),
+      http.get('/api/v1/k8s/clusters/:id/events', () => HttpResponse.json({ items: [], total: 0, limit: 100, offset: 0 })),
+    );
+
+    renderKubernetesDetail('/kubernetes/1?tab=namespaces');
+
+    expect(await screen.findByText('Deployment/late-api')).toBeInTheDocument();
+    const namespaceCell = (await screen.findAllByText('late-page')).find((item) => item.closest('td'));
+    const row = namespaceCell?.closest('tr');
+    expect(row).not.toBeNull();
+    expect(within(row as HTMLElement).getByText('1400')).toBeInTheDocument();
+    expect(within(row as HTMLElement).getByText('12')).toBeInTheDocument();
+    expect(screen.getAllByRole('option', { name: 'late-page' }).length).toBeGreaterThan(0);
   });
 
   it('异常 Pod 通过 ReplicaSet 合并到 Deployment 根因', async () => {
