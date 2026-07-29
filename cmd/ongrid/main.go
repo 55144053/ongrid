@@ -983,13 +983,16 @@ func main() {
 		})
 	}
 	// Loki / Tempo URL probes — back the Integrations "测试连接" buttons.
-	// They both hit GET <url>/ready with optional basic auth + TLS-skip.
+	// Loki checks /ready; Tempo checks either a query URL or an explicit
+	// edge-facing OTLP/HTTP endpoint. Tempo's manager-side query readiness is
+	// wired separately below because standard deployments use another port.
 	lokiProbe := managerbizsetting.NewLokiURLProbe(lokiResolver)
-	tempoProbe := managerbizsetting.NewTempoURLProbe(tempoResolver)
+	tempoIngestProbe := managerbizsetting.NewTempoURLProbe(tempoResolver)
+	tempoReadinessProbe := managerbizsetting.NewTempoReadinessProbe(cfg.Traces.URL)
 	// Web search probe — same WebSearchResolver the skill uses, so a
 	// passing probe means the skill itself will work.
 	webSearchProbe := managerbizsetting.NewWebSearchProbe(managerbizsetting.NewWebSearchResolver(settingSvc))
-	integrationHandler = managerserverintegration.NewHandler(grafanaSvc, promTester, lokiProbe, tempoProbe, webSearchProbe)
+	integrationHandler = managerserverintegration.NewHandler(grafanaSvc, promTester, lokiProbe, tempoIngestProbe, webSearchProbe)
 	integrationHandler.SetLLMRouter(llmRouter)
 	integrationHandler.SetLLMProbe(managerbizsetting.NewLLMConfigurationService(llmEnvDefaults, settingSvc))
 
@@ -1729,7 +1732,7 @@ func main() {
 		Prom:      promTester,
 		Grafana:   grafanaSvc,
 		Loki:      lokiProbe,
-		Tempo:     tempoProbe,
+		Tempo:     tempoReadinessProbe,
 		Rules:     alertSvc,
 		Incidents: alertSvc,
 		Edges:     edgeSvc,

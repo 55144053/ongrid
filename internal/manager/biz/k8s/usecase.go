@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +30,8 @@ const (
 	defaultEventRetention       = 24 * time.Hour
 	defaultEventMaxPerCluster   = 5000
 	defaultEventCleanupInterval = time.Hour
+	actionableWarningWindow     = 15 * time.Minute
+	hpaMetricWarningWindow      = 5 * time.Minute
 	eventRetentionBatchLimit    = 1000
 	bootstrapTokenBytes         = 32
 	defaultK8sChartRef          = "oci://helm.cnb.cool/ongridio/ongrid-edge"
@@ -88,6 +91,7 @@ type Repository interface {
 	ListEdgeAttachments(ctx context.Context, limit, offset int) ([]EdgeAttachment, int64, error)
 	ListWorkloads(ctx context.Context, f ListWorkloadsFilter) ([]*model.Workload, error)
 	CountWorkloads(ctx context.Context, f ListWorkloadsFilter) (int64, error)
+	ListNamespaceSummaries(ctx context.Context, clusterID uint64) ([]NamespaceSummary, error)
 	ListPods(ctx context.Context, f ListPodsFilter) ([]*model.Pod, error)
 	CountPods(ctx context.Context, f ListPodsFilter) (int64, error)
 	ListEvents(ctx context.Context, f ListEventsFilter) ([]*model.Event, error)
@@ -157,6 +161,16 @@ type ClusterHealthSummary struct {
 	OOMKilledPods        int64
 	ImagePullBackOffPods int64
 	NotReadyNodes        int64
+	Namespaces           []NamespaceSummary
+}
+
+type NamespaceSummary struct {
+	Namespace  string
+	Workloads  int64
+	Pods       int64
+	Events     int64
+	Warnings   int64
+	LastSeenAt *time.Time
 }
 
 type Config struct {
@@ -376,14 +390,25 @@ type ListNodesFilter struct {
 	Offset    int
 }
 
-type ListWorkloadsFilter struct {
-	ClusterID uint64
+// WorkloadOwnerRef identifies a workload controller whose retained children
+// should be loaded. UID is authoritative; name is the compatibility fallback.
+type WorkloadOwnerRef struct {
 	Namespace string
 	Kind      string
-	Query     string
-	IssueOnly bool
-	Limit     int
-	Offset    int
+	Name      string
+	UID       string
+}
+
+type ListWorkloadsFilter struct {
+	ClusterID        uint64
+	Namespace        string
+	Kind             string
+	Query            string
+	IssueOnly        bool
+	GroupReplicaSets bool
+	OwnerRefs        []WorkloadOwnerRef
+	Limit            int
+	Offset           int
 }
 
 type ListPodsFilter struct {
@@ -673,7 +698,93 @@ func (u *Usecase) ListWorkloads(ctx context.Context, f ListWorkloadsFilter) ([]*
 	if _, err := u.repo.GetCluster(ctx, f.ClusterID); err != nil {
 		return nil, err
 	}
-	return u.repo.ListWorkloads(ctx, f)
+	items, err := u.repo.ListWorkloads(ctx, f)
+	if err != nil || !f.GroupReplicaSets || len(items) == 0 {
+		return items, err
+	}
+	ownerRefs := make([]WorkloadOwnerRef, 0, len(items))
+	for _, item := range items {
+		if item == nil || !strings.EqualFold(strings.TrimSpace(item.Kind), "Deployment") {
+			continue
+		}
+		ownerRefs = append(ownerRefs, WorkloadOwnerRef{
+			Namespace: item.Namespace,
+			Kind:      "Deployment",
+			Name:      item.Name,
+			UID:       item.UID,
+		})
+	}
+	if len(ownerRefs) == 0 {
+		return items, nil
+	}
+	replicaSets, err := u.repo.ListWorkloads(ctx, ListWorkloadsFilter{
+		ClusterID: f.ClusterID,
+		OwnerRefs: ownerRefs,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list deployment ReplicaSets: %w", err)
+	}
+	sortWorkloadRevisions(replicaSets)
+	groupedByUID := make(map[string][]*model.Workload, len(ownerRefs))
+	legacyByName := make(map[string][]*model.Workload, len(ownerRefs))
+	allByName := make(map[string][]*model.Workload, len(ownerRefs))
+	for _, item := range replicaSets {
+		if item == nil {
+			continue
+		}
+		nameKey := workloadOwnerKey(item.Namespace, item.OwnerKind, item.OwnerName)
+		allByName[nameKey] = append(allByName[nameKey], item)
+		if strings.TrimSpace(item.OwnerUID) == "" {
+			legacyByName[nameKey] = append(legacyByName[nameKey], item)
+			continue
+		}
+		uidKey := workloadOwnerKey(item.Namespace, item.OwnerKind, item.OwnerUID)
+		groupedByUID[uidKey] = append(groupedByUID[uidKey], item)
+	}
+	for _, item := range items {
+		if item == nil || !strings.EqualFold(strings.TrimSpace(item.Kind), "Deployment") {
+			continue
+		}
+		nameKey := workloadOwnerKey(item.Namespace, item.Kind, item.Name)
+		if strings.TrimSpace(item.UID) == "" {
+			item.ReplicaSets = allByName[nameKey]
+			sortWorkloadRevisions(item.ReplicaSets)
+			continue
+		}
+		uidKey := workloadOwnerKey(item.Namespace, item.Kind, item.UID)
+		item.ReplicaSets = append(groupedByUID[uidKey], legacyByName[nameKey]...)
+		sortWorkloadRevisions(item.ReplicaSets)
+	}
+	return items, nil
+}
+
+func workloadOwnerKey(namespace, kind, identity string) string {
+	return strings.TrimSpace(namespace) + "\x00" + strings.ToLower(strings.TrimSpace(kind)) + "\x00" + strings.TrimSpace(identity)
+}
+
+func sortWorkloadRevisions(items []*model.Workload) {
+	sort.SliceStable(items, func(i, j int) bool {
+		left, right := items[i], items[j]
+		if left == nil {
+			return false
+		}
+		if right == nil {
+			return true
+		}
+		if left.Revision != right.Revision {
+			return left.Revision > right.Revision
+		}
+		if left.ResourceCreatedAt != nil && right.ResourceCreatedAt != nil && !left.ResourceCreatedAt.Equal(*right.ResourceCreatedAt) {
+			return left.ResourceCreatedAt.After(*right.ResourceCreatedAt)
+		}
+		if left.ResourceCreatedAt != nil && right.ResourceCreatedAt == nil {
+			return true
+		}
+		if left.ResourceCreatedAt == nil && right.ResourceCreatedAt != nil {
+			return false
+		}
+		return left.Name > right.Name
+	})
 }
 
 func (u *Usecase) CountWorkloads(ctx context.Context, f ListWorkloadsFilter) (int64, error) {
@@ -810,8 +921,9 @@ func (u *Usecase) listActionableWarningEvents(ctx context.Context, f ListEventsF
 	}
 
 	actionable := make([]*model.Event, 0, len(events))
+	now := time.Now()
 	for _, event := range events {
-		if event != nil && actionableWarningEvent(event, podsByUID, podsByName, workloadKeys, nodeIssues) {
+		if event != nil && actionableWarningEvent(event, podsByUID, podsByName, workloadKeys, nodeIssues, now) {
 			actionable = append(actionable, event)
 		}
 	}
@@ -828,6 +940,7 @@ func (u *Usecase) listActionableWarningEvents(ctx context.Context, f ListEventsF
 func actionableWarningEvent(
 	event *model.Event,
 	podsByUID, podsByName, workloadKeys, nodeIssues map[string]struct{},
+	now time.Time,
 ) bool {
 	kind := strings.ToLower(strings.TrimSpace(event.InvolvedKind))
 	switch kind {
@@ -842,12 +955,55 @@ func actionableWarningEvent(
 	case "node":
 		_, ok := nodeIssues[event.InvolvedName]
 		return ok
-	case "deployment", "statefulset", "daemonset", "job", "cronjob":
+	case "deployment", "statefulset", "daemonset", "replicaset", "job":
 		_, ok := workloadKeys[workloadResourceKey(kind, eventResourceNamespace(event), event.InvolvedName)]
 		return ok
+	case "cronjob":
+		// CronJobs do not expose desired/ready replicas, so they are absent from
+		// the issue-only workload set even when a recent controller warning exists.
+		return warningEventIsRecent(event, now)
 	default:
-		return true
+		return warningEventIsRecent(event, now)
 	}
+}
+
+func warningEventIsRecent(event *model.Event, now time.Time) bool {
+	occurredAt, ok := warningEventOccurredAt(event)
+	return ok && !occurredAt.Before(now.Add(-warningActionableWindow(event)))
+}
+
+// HPA metric warnings are emitted continuously while the metrics pipeline is
+// unavailable. Once reconciliation succeeds Kubernetes stops refreshing the
+// Event, so a shorter quiet period is a reliable recovery signal without
+// requiring HPA objects in the workload inventory.
+func warningActionableWindow(event *model.Event) time.Duration {
+	if event == nil || !strings.EqualFold(strings.TrimSpace(event.InvolvedKind), "HorizontalPodAutoscaler") {
+		return actionableWarningWindow
+	}
+	switch strings.ToLower(strings.TrimSpace(event.Reason)) {
+	case "failedgetresourcemetric", "failedcomputemetricsreplicas":
+		return hpaMetricWarningWindow
+	default:
+		return actionableWarningWindow
+	}
+}
+
+// warningEventOccurredAt intentionally excludes LastSeenAt and UpdatedAt.
+// Inventory refreshes can advance those ingestion timestamps while Kubernetes
+// keeps an old Event object, which must not turn recovered warnings current.
+func warningEventOccurredAt(event *model.Event) (time.Time, bool) {
+	if event == nil {
+		return time.Time{}, false
+	}
+	for _, timestamp := range []*time.Time{event.LastTimestamp, event.EventTime, event.FirstTimestamp} {
+		if timestamp != nil && !timestamp.IsZero() {
+			return *timestamp, true
+		}
+	}
+	if !event.CreatedAt.IsZero() {
+		return event.CreatedAt, true
+	}
+	return time.Time{}, false
 }
 
 func eventResourceNamespace(event *model.Event) string {
@@ -874,7 +1030,7 @@ func (u *Usecase) GetClusterHealth(ctx context.Context, clusterID uint64) (Clust
 		return out, err
 	}
 	var err error
-	if out.DegradedWorkloads, err = u.repo.CountWorkloads(ctx, ListWorkloadsFilter{ClusterID: clusterID, IssueOnly: true}); err != nil {
+	if out.DegradedWorkloads, err = u.repo.CountWorkloads(ctx, ListWorkloadsFilter{ClusterID: clusterID, IssueOnly: true, GroupReplicaSets: true}); err != nil {
 		return out, err
 	}
 	if out.PendingPods, err = u.repo.CountPods(ctx, ListPodsFilter{ClusterID: clusterID, Phase: "Pending"}); err != nil {
@@ -904,7 +1060,57 @@ func (u *Usecase) GetClusterHealth(ctx context.Context, clusterID uint64) (Clust
 			out.NotReadyNodes++
 		}
 	}
+	out.Namespaces, err = u.namespaceSummaries(ctx, clusterID)
+	if err != nil {
+		return out, err
+	}
 	return out, nil
+}
+
+func (u *Usecase) namespaceSummaries(ctx context.Context, clusterID uint64) ([]NamespaceSummary, error) {
+	summaries, err := u.repo.ListNamespaceSummaries(ctx, clusterID)
+	if err != nil {
+		return nil, err
+	}
+	byNamespace := make(map[string]*NamespaceSummary, len(summaries))
+	for _, current := range summaries {
+		namespace := strings.TrimSpace(current.Namespace)
+		if namespace == "" {
+			namespace = "default"
+		}
+		current.Namespace = namespace
+		summary := current
+		byNamespace[namespace] = &summary
+	}
+	warnings, err := u.listActionableWarningEvents(ctx, ListEventsFilter{ClusterID: clusterID})
+	if err != nil {
+		return nil, err
+	}
+	for _, event := range warnings {
+		if event == nil {
+			continue
+		}
+		namespace := strings.TrimSpace(eventResourceNamespace(event))
+		if namespace == "" {
+			namespace = "default"
+		}
+		summary := byNamespace[namespace]
+		if summary == nil {
+			summary = &NamespaceSummary{Namespace: namespace}
+			byNamespace[namespace] = summary
+		}
+		summary.Warnings++
+		if occurredAt, ok := warningEventOccurredAt(event); ok && (summary.LastSeenAt == nil || occurredAt.After(*summary.LastSeenAt)) {
+			ts := occurredAt
+			summary.LastSeenAt = &ts
+		}
+	}
+	summaries = summaries[:0]
+	for _, summary := range byNamespace {
+		summaries = append(summaries, *summary)
+	}
+	sort.Slice(summaries, func(i, j int) bool { return summaries[i].Namespace < summaries[j].Namespace })
+	return summaries, nil
 }
 
 func nodeIsNotReady(raw string) bool {
@@ -1054,6 +1260,7 @@ type TelemetryConfig struct {
 	ClusterID              uint64
 	AccessKey              string
 	SecretKey              string
+	ManagerPublicURL       string
 	TracesEndpoint         string
 	TracesAuthMode         string
 	TracesBasicUser        string
@@ -1536,18 +1743,31 @@ func (u *Usecase) IngestInventory(ctx context.Context, edgeID uint64, in tunnel.
 			continue
 		}
 		ts := now
+		var resourceCreatedAt *time.Time
+		if item.CreationTimestamp != nil {
+			createdAt := item.CreationTimestamp.UTC()
+			resourceCreatedAt = &createdAt
+		}
 		workloads = append(workloads, &model.Workload{
-			ClusterID:       in.ClusterID,
-			Namespace:       strings.TrimSpace(item.Namespace),
-			Kind:            kind,
-			Name:            name,
-			UID:             strings.TrimSpace(item.UID),
-			DesiredReplicas: item.DesiredReplicas,
-			ReadyReplicas:   item.ReadyReplicas,
-			LabelsJSON:      jsonText(k8sredact.StringMap(item.Labels), "{}"),
-			AnnotationsJSON: jsonText(k8sredact.StringMap(item.Annotations), "{}"),
-			ConditionsJSON:  jsonText(item.Conditions, "[]"),
-			LastSeenAt:      &ts,
+			ClusterID:         in.ClusterID,
+			Namespace:         strings.TrimSpace(item.Namespace),
+			Kind:              kind,
+			Name:              name,
+			UID:               strings.TrimSpace(item.UID),
+			DesiredReplicas:   item.DesiredReplicas,
+			ReadyReplicas:     item.ReadyReplicas,
+			ActiveReplicas:    item.ActiveReplicas,
+			FailedReplicas:    item.FailedReplicas,
+			IsTerminalFailure: workloadHasTerminalFailure(item.Conditions),
+			OwnerKind:         strings.TrimSpace(item.OwnerKind),
+			OwnerName:         strings.TrimSpace(item.OwnerName),
+			OwnerUID:          strings.TrimSpace(item.OwnerUID),
+			Revision:          item.Revision,
+			ResourceCreatedAt: resourceCreatedAt,
+			LabelsJSON:        jsonText(k8sredact.StringMap(item.Labels), "{}"),
+			AnnotationsJSON:   jsonText(k8sredact.StringMap(item.Annotations), "{}"),
+			ConditionsJSON:    jsonText(item.Conditions, "[]"),
+			LastSeenAt:        &ts,
 		})
 	}
 	if err := u.repo.UpsertWorkloads(ctx, workloads); err != nil {
@@ -1673,6 +1893,17 @@ func (u *Usecase) IngestInventory(ctx context.Context, edgeID uint64, in tunnel.
 		return nil, err
 	}
 	return result, nil
+}
+
+func workloadHasTerminalFailure(conditions []map[string]string) bool {
+	for _, condition := range conditions {
+		typeName := strings.ToLower(strings.TrimSpace(condition["type"]))
+		status := strings.ToLower(strings.TrimSpace(condition["status"]))
+		if status == "true" && (typeName == "failed" || typeName == "failuretarget") {
+			return true
+		}
+	}
+	return false
 }
 
 const (
@@ -1946,9 +2177,10 @@ func newTelemetryCredential(clusterID uint64) (*model.TelemetryCredential, strin
 func (u *Usecase) resolveTelemetryConfig(ctx context.Context, clusterID uint64, accessKey, secretKey string) (*TelemetryConfig, error) {
 	publicURL := strings.TrimRight(strings.TrimSpace(u.cfg.PublicURL), "/")
 	out := &TelemetryConfig{
-		ClusterID: clusterID,
-		AccessKey: accessKey,
-		SecretKey: secretKey,
+		ClusterID:        clusterID,
+		AccessKey:        accessKey,
+		SecretKey:        secretKey,
+		ManagerPublicURL: publicURL,
 	}
 	traces, err := u.resolveTelemetryTarget(ctx, TelemetrySignalTraces, endpointPath(publicURL, "/v1/traces"))
 	if err != nil {

@@ -82,6 +82,7 @@ func loadStoredK8sCredential(ctx context.Context, cfg *config.Config, info *tunn
 	}
 	cfg.Edge.AccessKey = stored.AccessKey
 	cfg.Edge.SecretKey = stored.SecretKey
+	cfg.Edge.ManagerPublicURL = strings.TrimRight(strings.TrimSpace(stored.ManagerPublicURL), "/")
 	if cfg.Edge.CloudAddr == "" && stored.CloudAddr != "" {
 		cfg.Edge.CloudAddr = stored.CloudAddr
 	}
@@ -133,7 +134,7 @@ func storeK8sCredential(ctx context.Context, info *tunnel.KubernetesInfo, out k8
 			return fmt.Errorf("kubernetes telemetry credential does not match controller cluster")
 		}
 		telemetry := *out.Telemetry
-		applyManagerTelemetryTLS(&telemetry, out.ManagerPublicURL)
+		applyManagerTelemetryTLS(&telemetry, out.ManagerPublicURL, telemetry.ManagerPublicURL)
 		telemetryClient := *client
 		if secretName := strings.TrimSpace(os.Getenv("ONGRID_K8S_TELEMETRY_SECRET")); secretName != "" {
 			telemetryClient.secretName = secretName
@@ -217,6 +218,7 @@ func loadStoredK8sCredentialFile(cfg *config.Config, info *tunnel.KubernetesInfo
 	}
 	cfg.Edge.AccessKey = stored.AccessKey
 	cfg.Edge.SecretKey = stored.SecretKey
+	cfg.Edge.ManagerPublicURL = strings.TrimRight(strings.TrimSpace(stored.ManagerPublicURL), "/")
 	if cfg.Edge.CloudAddr == "" && stored.CloudAddr != "" {
 		cfg.Edge.CloudAddr = stored.CloudAddr
 	}
@@ -479,17 +481,31 @@ func dataContainsValues(current, desired map[string][]byte) bool {
 // applyManagerTelemetryTLS carries the controller's explicit trust choice to
 // Manager-origin signals only. External backends keep the TLS policy resolved
 // by Manager from their integration settings.
-func applyManagerTelemetryTLS(in *k8sTelemetryConfig, managerURL string) {
+func applyManagerTelemetryTLS(in *k8sTelemetryConfig, managerURLs ...string) {
 	if in == nil || !parseBoolEnv("ONGRID_K8S_ENROLL_TLS_INSECURE", false) {
 		return
 	}
-	manager, managerErr := url.Parse(strings.TrimSpace(managerURL))
-	if managerErr != nil || manager.Scheme == "" || manager.Host == "" {
+	managerOrigins := make([]*url.URL, 0, len(managerURLs))
+	for _, raw := range managerURLs {
+		manager, err := url.Parse(strings.TrimSpace(raw))
+		if err == nil && manager.Scheme != "" && manager.Host != "" {
+			managerOrigins = append(managerOrigins, manager)
+		}
+	}
+	if len(managerOrigins) == 0 {
 		return
 	}
 	sameOrigin := func(raw string) bool {
 		target, err := url.Parse(strings.TrimSpace(raw))
-		return err == nil && strings.EqualFold(manager.Scheme, target.Scheme) && strings.EqualFold(manager.Host, target.Host)
+		if err != nil {
+			return false
+		}
+		for _, manager := range managerOrigins {
+			if strings.EqualFold(manager.Scheme, target.Scheme) && strings.EqualFold(manager.Host, target.Host) {
+				return true
+			}
+		}
+		return false
 	}
 	if sameOrigin(in.TracesEndpoint) {
 		in.TracesTLSInsecure = true

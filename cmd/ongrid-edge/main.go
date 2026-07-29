@@ -494,6 +494,7 @@ type k8sTelemetryConfig struct {
 	ClusterID              uint64 `json:"cluster_id"`
 	AccessKey              string `json:"access_key"`
 	SecretKey              string `json:"secret_key"`
+	ManagerPublicURL       string `json:"manager_public_url,omitempty"`
 	TracesEndpoint         string `json:"traces_endpoint,omitempty"`
 	TracesAuthMode         string `json:"traces_auth_mode,omitempty"`
 	TracesBasicUser        string `json:"traces_basic_user,omitempty"`
@@ -624,6 +625,7 @@ func ensureK8sEnrollment(ctx context.Context, cfg *config.Config, log *slog.Logg
 	}
 	cfg.Edge.AccessKey = out.AccessKey
 	cfg.Edge.SecretKey = out.SecretKey
+	cfg.Edge.ManagerPublicURL = strings.TrimRight(strings.TrimSpace(out.ManagerPublicURL), "/")
 	if cfg.Edge.CloudAddr == "" && out.CloudAddr != "" {
 		cfg.Edge.CloudAddr = out.CloudAddr
 	}
@@ -689,7 +691,11 @@ func refreshK8sTelemetryConfig(ctx context.Context, cfg *config.Config, managerU
 	if out.ClusterID == 0 || out.AccessKey == "" || out.SecretKey == "" {
 		return nil, fmt.Errorf("k8s telemetry config response is incomplete")
 	}
-	applyManagerTelemetryTLS(&out, managerURL)
+	canonicalManagerURL := strings.TrimRight(strings.TrimSpace(out.ManagerPublicURL), "/")
+	applyManagerTelemetryTLS(&out, managerURL, cfg.Edge.ManagerPublicURL, canonicalManagerURL)
+	if canonicalManagerURL != "" {
+		cfg.Edge.ManagerPublicURL = canonicalManagerURL
+	}
 	return &out, nil
 }
 
