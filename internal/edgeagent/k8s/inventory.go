@@ -604,27 +604,9 @@ func (c *apiClient) listEvents(ctx context.Context, namespace string) ([]tunnel.
 	}
 	out := make([]tunnel.KubernetesEventSnapshot, 0, len(items))
 	for _, item := range items {
-		out = append(out, tunnel.KubernetesEventSnapshot{
-			Namespace:           item.Metadata.Namespace,
-			Name:                item.Metadata.Name,
-			UID:                 item.Metadata.UID,
-			Type:                item.Type,
-			Reason:              item.Reason,
-			Message:             k8sredact.Text(item.Message),
-			InvolvedKind:        item.InvolvedObject.Kind,
-			InvolvedNamespace:   item.InvolvedObject.Namespace,
-			InvolvedName:        item.InvolvedObject.Name,
-			InvolvedUID:         item.InvolvedObject.UID,
-			SourceComponent:     item.Source.Component,
-			SourceHost:          item.Source.Host,
-			ReportingController: item.ReportingComponent,
-			ReportingInstance:   item.ReportingInstance,
-			Action:              item.Action,
-			Count:               item.Count,
-			FirstTimestamp:      item.FirstTimestamp,
-			LastTimestamp:       item.LastTimestamp,
-			EventTime:           item.EventTime,
-		})
+		snapshot := eventSnapshotFromItem(item)
+		snapshot.Message = k8sredact.Text(snapshot.Message)
+		out = append(out, snapshot)
 	}
 	return out, rv, nil
 }
@@ -1177,13 +1159,19 @@ type eventItem struct {
 		Component string `json:"component"`
 		Host      string `json:"host"`
 	} `json:"source"`
-	ReportingComponent string `json:"reportingComponent"`
-	ReportingInstance  string `json:"reportingInstance"`
-	Action             string `json:"action"`
-	Count              int    `json:"count"`
-	FirstTimestamp     string `json:"firstTimestamp"`
-	LastTimestamp      string `json:"lastTimestamp"`
-	EventTime          string `json:"eventTime"`
+	ReportingComponent string       `json:"reportingComponent"`
+	ReportingInstance  string       `json:"reportingInstance"`
+	Action             string       `json:"action"`
+	Count              int          `json:"count"`
+	FirstTimestamp     string       `json:"firstTimestamp"`
+	LastTimestamp      string       `json:"lastTimestamp"`
+	EventTime          string       `json:"eventTime"`
+	Series             *eventSeries `json:"series"`
+}
+
+type eventSeries struct {
+	Count            int    `json:"count"`
+	LastObservedTime string `json:"lastObservedTime"`
 }
 
 type containerStatus struct {

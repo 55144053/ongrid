@@ -164,7 +164,8 @@ func TestAPIClientListCoreResourcesDecodesResourceSchemas(t *testing.T) {
 				"type":"Warning","reason":"Failed","message":"container failed",
 				"source":{"component":"kubelet","host":"node-a"},
 				"reportingComponent":"kubelet","reportingInstance":"node-a","action":"BackOff","count":3,
-				"firstTimestamp":"2026-07-29T00:00:00Z","lastTimestamp":"2026-07-29T00:01:00Z","eventTime":"2026-07-29T00:01:00.123456Z"
+				"firstTimestamp":"2026-07-29T00:00:00Z","lastTimestamp":"2026-07-29T00:01:00Z","eventTime":"2026-07-29T00:00:00.123456Z",
+				"series":{"count":7,"lastObservedTime":"2026-07-29T00:03:00.123456Z"}
 			}]
 		}`)
 
@@ -177,10 +178,10 @@ func TestAPIClientListCoreResourcesDecodesResourceSchemas(t *testing.T) {
 			t.Fatalf("resourceVersion = %q events = %d, want 53 and 1", rv, len(items))
 		}
 		got := items[0]
-		if got.Name != "api.123" || got.InvolvedKind != "Pod" || got.InvolvedName != "api-0" || got.Count != 3 {
+		if got.Name != "api.123" || got.InvolvedKind != "Pod" || got.InvolvedName != "api-0" || got.Count != 7 {
 			t.Fatalf("event snapshot = %+v", got)
 		}
-		if got.SourceComponent != "kubelet" || got.ReportingController != "kubelet" || got.EventTime != "2026-07-29T00:01:00.123456Z" {
+		if got.SourceComponent != "kubelet" || got.ReportingController != "kubelet" || got.EventTime != "2026-07-29T00:00:00.123456Z" || got.LastTimestamp != "2026-07-29T00:03:00.123456Z" {
 			t.Fatalf("event source/time = %+v", got)
 		}
 	})
@@ -253,7 +254,8 @@ func TestInventoryCacheApplyWatchUpsertDecodesCoreResourceSchemas(t *testing.T) 
 				"involvedObject":{"kind":"Pod","namespace":"apps","name":"api-0","uid":"pod-uid"},
 				"type":"Warning","reason":"Failed","message":"container failed","source":{"component":"kubelet","host":"node-a"},
 				"reportingComponent":"kubelet","reportingInstance":"node-a","action":"BackOff","count":3,
-				"firstTimestamp":"2026-07-29T00:00:00Z","lastTimestamp":"2026-07-29T00:01:00Z","eventTime":"2026-07-29T00:01:00.123456Z"
+				"firstTimestamp":"2026-07-29T00:00:00Z","lastTimestamp":"2026-07-29T00:01:00Z","eventTime":"2026-07-29T00:00:00.123456Z",
+				"series":{"count":7,"lastObservedTime":"2026-07-29T00:03:00.123456Z"}
 			}`),
 		}, time.Unix(100, 0))
 		if err != nil {
@@ -263,7 +265,7 @@ func TestInventoryCacheApplyWatchUpsertDecodesCoreResourceSchemas(t *testing.T) 
 			t.Fatalf("trigger events len = %d, want 1", len(trigger.events))
 		}
 		got := trigger.events[0]
-		if got.Name != "api.123" || got.InvolvedName != "api-0" || got.Count != 3 || got.EventTime != "2026-07-29T00:01:00.123456Z" {
+		if got.Name != "api.123" || got.InvolvedName != "api-0" || got.Count != 7 || got.EventTime != "2026-07-29T00:00:00.123456Z" || got.LastTimestamp != "2026-07-29T00:03:00.123456Z" {
 			t.Fatalf("event snapshot = %+v", got)
 		}
 	})

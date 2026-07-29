@@ -955,13 +955,21 @@ func actionableWarningEvent(
 	case "node":
 		_, ok := nodeIssues[event.InvolvedName]
 		return ok
-	case "deployment", "statefulset", "daemonset", "replicaset", "job", "cronjob":
+	case "deployment", "statefulset", "daemonset", "replicaset", "job":
 		_, ok := workloadKeys[workloadResourceKey(kind, eventResourceNamespace(event), event.InvolvedName)]
 		return ok
+	case "cronjob":
+		// CronJobs do not expose desired/ready replicas, so they are absent from
+		// the issue-only workload set even when a recent controller warning exists.
+		return warningEventIsRecent(event, now)
 	default:
-		occurredAt, ok := warningEventOccurredAt(event)
-		return ok && !occurredAt.Before(now.Add(-warningActionableWindow(event)))
+		return warningEventIsRecent(event, now)
 	}
+}
+
+func warningEventIsRecent(event *model.Event, now time.Time) bool {
+	occurredAt, ok := warningEventOccurredAt(event)
+	return ok && !occurredAt.Before(now.Add(-warningActionableWindow(event)))
 }
 
 // HPA metric warnings are emitted continuously while the metrics pipeline is

@@ -1967,7 +1967,7 @@ func TestUsecaseListEventsIssueOnlyExcludesRecoveredWarnings(t *testing.T) {
 	}
 }
 
-func TestActionableWarningEventUntrackedResourceUsesOccurrenceTime(t *testing.T) {
+func TestActionableWarningEventUnmodeledHealthUsesOccurrenceTime(t *testing.T) {
 	now := time.Date(2026, 7, 29, 6, 0, 0, 0, time.UTC)
 	recent := now.Add(-actionableWarningWindow)
 	stale := recent.Add(-time.Nanosecond)
@@ -1994,6 +1994,24 @@ func TestActionableWarningEventUntrackedResourceUsesOccurrenceTime(t *testing.T)
 			name:  "ingestion timestamp only",
 			event: &model.Event{InvolvedKind: "HorizontalPodAutoscaler", LastSeenAt: &lastSeen},
 			want:  false,
+		},
+		{
+			name: "recent CronJob warning",
+			event: &model.Event{
+				InvolvedKind:  "CronJob",
+				Reason:        "FailedCreate",
+				LastTimestamp: &recent,
+			},
+			want: true,
+		},
+		{
+			name: "stale CronJob warning",
+			event: &model.Event{
+				InvolvedKind:  "CronJob",
+				Reason:        "FailedCreate",
+				LastTimestamp: &stale,
+			},
+			want: false,
 		},
 		{
 			name: "repeating HPA metric warning at recent boundary",

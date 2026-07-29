@@ -303,11 +303,38 @@ func eventSnapshotFromItem(item eventItem) tunnel.KubernetesEventSnapshot {
 		ReportingController: item.ReportingComponent,
 		ReportingInstance:   item.ReportingInstance,
 		Action:              item.Action,
-		Count:               item.Count,
+		Count:               eventOccurrenceCount(item),
 		FirstTimestamp:      item.FirstTimestamp,
-		LastTimestamp:       item.LastTimestamp,
+		LastTimestamp:       eventLastObservedTimestamp(item),
 		EventTime:           item.EventTime,
 	}
+}
+
+func eventOccurrenceCount(item eventItem) int {
+	if item.Series != nil && item.Series.Count > item.Count {
+		return item.Series.Count
+	}
+	return item.Count
+}
+
+func eventLastObservedTimestamp(item eventItem) string {
+	current := strings.TrimSpace(item.LastTimestamp)
+	if item.Series == nil {
+		return current
+	}
+	candidate := strings.TrimSpace(item.Series.LastObservedTime)
+	if candidate == "" {
+		return current
+	}
+	candidateTime, err := time.Parse(time.RFC3339Nano, candidate)
+	if err != nil {
+		return current
+	}
+	currentTime, err := time.Parse(time.RFC3339Nano, current)
+	if err != nil || candidateTime.After(currentTime) {
+		return candidate
+	}
+	return current
 }
 
 func nodeSnapshotKey(item tunnel.KubernetesNodeSnapshot) string {

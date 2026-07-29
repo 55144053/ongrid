@@ -4317,7 +4317,7 @@ function buildTriageIssues({
   warningEvents: KubernetesEvent[];
   tr: (zh: string, en: string) => string;
 }) {
-  const degradedWorkloads = workloads.filter(isDegradedWorkload).slice(0, 6);
+  const degradedWorkloads = workloads.filter(isDegradedWorkload);
   const abnormalPods = buildAbnormalPods(pods, crashLoopPods);
   const degradedWorkloadOwners = buildDegradedWorkloadOwnerIndex(degradedWorkloads);
   const nodeIssues = buildNodeIssues(nodes);
@@ -4325,8 +4325,8 @@ function buildTriageIssues({
   const syncRisk = clusterSyncRisk(cluster, tr);
   return sortTriageIssues(aggregateTriageIssues([
     ...degradedWorkloads.map((item) => workloadIssue(item, tr)),
-    ...abnormalPods.slice(0, 6).map((item) => podIssue(item, tr, owningDegradedWorkload(item, degradedWorkloadOwners))),
-    ...nodeIssues.slice(0, 6),
+    ...abnormalPods.map((item) => podIssue(item, tr, owningDegradedWorkload(item, degradedWorkloadOwners))),
+    ...nodeIssues,
     ...(syncRisk ? [syncRiskIssue(syncRisk, tr)] : []),
     ...actionableWarningEvents.map(eventIssue),
   ]));

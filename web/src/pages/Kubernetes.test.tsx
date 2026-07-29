@@ -576,6 +576,58 @@ describe('KubernetesPage', () => {
     expect(screen.getAllByRole('option', { name: 'late-page' }).length).toBeGreaterThan(0);
   });
 
+  it('关键异常先按严重程度排序再截断展示', async () => {
+    const degradedDeployments = Array.from({ length: 8 }, (_, index) => ({
+      id: 1600 + index,
+      cluster_id: 1,
+      namespace: 'apps',
+      kind: 'Deployment',
+      name: `degraded-${index + 1}`,
+      uid: `degraded-${index + 1}-uid`,
+      desired_replicas: 2,
+      ready_replicas: 1,
+      conditions: [],
+      last_seen_at: new Date().toISOString(),
+    }));
+    const failedJob = {
+      id: 1700,
+      cluster_id: 1,
+      namespace: 'apps',
+      kind: 'Job',
+      name: 'critical-failed',
+      uid: 'critical-failed-uid',
+      desired_replicas: 1,
+      ready_replicas: 0,
+      active_replicas: 0,
+      failed_replicas: 1,
+      conditions: [{ type: 'Failed', status: 'True', reason: 'BackoffLimitExceeded' }],
+      last_seen_at: new Date().toISOString(),
+    };
+    server.use(
+      http.get('/api/v1/k8s/clusters/:id/health', () => HttpResponse.json({
+        degraded_workloads: 9,
+        pending_pods: 0,
+        crash_loop_back_off_pods: 0,
+        oom_killed_pods: 0,
+        image_pull_back_off_pods: 0,
+        not_ready_nodes: 0,
+      })),
+      http.get('/api/v1/k8s/clusters/:id/workloads', ({ request }) => {
+        const issueOnly = new URL(request.url).searchParams.get('issue_only') === 'true';
+        const items = issueOnly ? [...degradedDeployments, failedJob] : [];
+        return HttpResponse.json({ items, total: items.length, limit: 100, offset: 0 });
+      }),
+      http.get('/api/v1/k8s/clusters/:id/pods', () => HttpResponse.json({ items: [], total: 0, limit: 100, offset: 0 })),
+      http.get('/api/v1/k8s/clusters/:id/events', () => HttpResponse.json({ items: [], total: 0, limit: 100, offset: 0 })),
+    );
+
+    renderKubernetesDetail('/kubernetes/1?tab=workloads');
+
+    expect(await screen.findByText('Job/critical-failed')).toBeInTheDocument();
+    expect(screen.getByText('9 个待确认问题')).toBeInTheDocument();
+    expect(screen.queryByText('Deployment/degraded-8')).not.toBeInTheDocument();
+  });
+
   it('异常 Pod 通过 ReplicaSet 合并到 Deployment 根因', async () => {
     const deployment = {
       id: 54,
