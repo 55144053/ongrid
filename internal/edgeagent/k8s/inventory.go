@@ -819,22 +819,34 @@ func (c *apiClient) listWorkloads(ctx context.Context, group, resource, kind, na
 	if namespace != "" {
 		apiPath = "/apis/" + group + "/v1/namespaces/" + url.PathEscape(namespace) + "/" + resource
 	}
-	items, rv, err := listAllK8sItems[workloadItem](ctx, c, apiPath)
+	apiItems, rv, err := listAllK8sItems[workloadAPIItem](ctx, c, apiPath)
 	if err != nil {
 		return nil, "", err
 	}
-	out := make([]tunnel.KubernetesWorkloadSnapshot, 0, len(items))
-	for _, item := range items {
+	out := make([]tunnel.KubernetesWorkloadSnapshot, 0, len(apiItems))
+	for index, apiItem := range apiItems {
+		item, err := decodeWorkloadItem(kind, apiItem)
+		if err != nil {
+			return nil, "", fmt.Errorf("decode %s item %d: %w", resource, index, err)
+		}
+		ownerKind, ownerName, ownerUID := controllerOwnerDetails(item.Metadata.OwnerReferences)
 		out = append(out, tunnel.KubernetesWorkloadSnapshot{
-			Kind:            kind,
-			Namespace:       item.Metadata.Namespace,
-			Name:            item.Metadata.Name,
-			UID:             item.Metadata.UID,
-			DesiredReplicas: desiredReplicas(kind, item),
-			ReadyReplicas:   readyReplicas(kind, item),
-			Labels:          k8sredact.StringMap(item.Metadata.Labels),
-			Annotations:     k8sredact.StringMap(item.Metadata.Annotations),
-			Conditions:      conditionMaps(item.Status.Conditions),
+			Kind:              kind,
+			Namespace:         item.Metadata.Namespace,
+			Name:              item.Metadata.Name,
+			UID:               item.Metadata.UID,
+			DesiredReplicas:   item.DesiredReplicas,
+			ReadyReplicas:     item.ReadyReplicas,
+			ActiveReplicas:    item.ActiveReplicas,
+			FailedReplicas:    item.FailedReplicas,
+			OwnerKind:         ownerKind,
+			OwnerName:         ownerName,
+			OwnerUID:          ownerUID,
+			Revision:          workloadRevision(item.Metadata.Annotations),
+			CreationTimestamp: item.Metadata.CreationTimestamp,
+			Labels:            k8sredact.StringMap(item.Metadata.Labels),
+			Annotations:       k8sredact.StringMap(item.Metadata.Annotations),
+			Conditions:        conditionMaps(item.Conditions),
 		})
 	}
 	return out, rv, nil
@@ -1008,13 +1020,14 @@ func watchEventError(event k8sWatchEvent) error {
 }
 
 type objectMeta struct {
-	Name            string            `json:"name"`
-	Namespace       string            `json:"namespace"`
-	UID             string            `json:"uid"`
-	ResourceVersion string            `json:"resourceVersion"`
-	Labels          map[string]string `json:"labels"`
-	Annotations     map[string]string `json:"annotations"`
-	OwnerReferences []ownerRef        `json:"ownerReferences"`
+	Name              string            `json:"name"`
+	Namespace         string            `json:"namespace"`
+	UID               string            `json:"uid"`
+	ResourceVersion   string            `json:"resourceVersion"`
+	CreationTimestamp *time.Time        `json:"creationTimestamp"`
+	Labels            map[string]string `json:"labels"`
+	Annotations       map[string]string `json:"annotations"`
+	OwnerReferences   []ownerRef        `json:"ownerReferences"`
 }
 
 type listMeta struct {
@@ -1025,6 +1038,7 @@ type listMeta struct {
 type ownerRef struct {
 	Kind       string `json:"kind"`
 	Name       string `json:"name"`
+	UID        string `json:"uid"`
 	Controller *bool  `json:"controller"`
 }
 
@@ -1056,27 +1070,60 @@ type nodeItem struct {
 	} `json:"status"`
 }
 
-type workloadList struct {
-	Metadata listMeta       `json:"metadata"`
-	Items    []workloadItem `json:"items"`
+type workloadItem struct {
+	Metadata        objectMeta
+	DesiredReplicas int
+	ReadyReplicas   int
+	ActiveReplicas  int
+	FailedReplicas  int
+	Conditions      []k8sCondition
 }
 
-type workloadItem struct {
-	Metadata objectMeta `json:"metadata"`
-	Spec     struct {
-		Replicas    *int `json:"replicas"`
-		Completions *int `json:"completions"`
-	} `json:"spec"`
-	Status struct {
-		Replicas               int            `json:"replicas"`
-		ReadyReplicas          int            `json:"readyReplicas"`
-		AvailableReplicas      int            `json:"availableReplicas"`
-		DesiredNumberScheduled int            `json:"desiredNumberScheduled"`
-		NumberReady            int            `json:"numberReady"`
-		Succeeded              int            `json:"succeeded"`
-		Active                 int            `json:"active"`
-		Conditions             []k8sCondition `json:"conditions"`
-	} `json:"status"`
+type workloadAPIItem struct {
+	Metadata objectMeta      `json:"metadata"`
+	Spec     json.RawMessage `json:"spec"`
+	Status   json.RawMessage `json:"status"`
+}
+
+type replicatedWorkloadSpec struct {
+	Replicas *int `json:"replicas"`
+}
+
+type replicatedWorkloadStatus struct {
+	Replicas      int            `json:"replicas"`
+	ReadyReplicas int            `json:"readyReplicas"`
+	Conditions    []k8sCondition `json:"conditions"`
+}
+
+type daemonSetStatus struct {
+	DesiredNumberScheduled int            `json:"desiredNumberScheduled"`
+	NumberReady            int            `json:"numberReady"`
+	Conditions             []k8sCondition `json:"conditions"`
+}
+
+type jobSpec struct {
+	Completions *int `json:"completions"`
+}
+
+type jobStatus struct {
+	Active     int            `json:"active"`
+	Succeeded  int            `json:"succeeded"`
+	Failed     int            `json:"failed"`
+	Conditions []k8sCondition `json:"conditions"`
+}
+
+type objectReference struct {
+	APIVersion      string `json:"apiVersion"`
+	Kind            string `json:"kind"`
+	Namespace       string `json:"namespace"`
+	Name            string `json:"name"`
+	UID             string `json:"uid"`
+	ResourceVersion string `json:"resourceVersion"`
+	FieldPath       string `json:"fieldPath"`
+}
+
+type cronJobStatus struct {
+	Active []objectReference `json:"active"`
 }
 
 type podList struct {
@@ -1165,15 +1212,28 @@ func conditionMaps(in []k8sCondition) []map[string]string {
 }
 
 func controllerOwner(refs []ownerRef) (string, string) {
+	kind, name, _ := controllerOwnerDetails(refs)
+	return kind, name
+}
+
+func controllerOwnerDetails(refs []ownerRef) (string, string, string) {
 	if len(refs) == 0 {
-		return "", ""
+		return "", "", ""
 	}
 	for _, ref := range refs {
 		if ref.Controller != nil && *ref.Controller {
-			return ref.Kind, ref.Name
+			return ref.Kind, ref.Name, ref.UID
 		}
 	}
-	return refs[0].Kind, refs[0].Name
+	return refs[0].Kind, refs[0].Name, refs[0].UID
+}
+
+func workloadRevision(annotations map[string]string) int64 {
+	revision, err := strconv.ParseInt(strings.TrimSpace(annotations["deployment.kubernetes.io/revision"]), 10, 64)
+	if err != nil || revision < 1 {
+		return 0
+	}
+	return revision
 }
 
 func podRestartCount(items []containerStatus) int {
@@ -1199,25 +1259,79 @@ func podReason(status podStatus) string {
 	return ""
 }
 
-func desiredReplicas(kind string, item workloadItem) int {
-	if item.Spec.Replicas != nil {
-		return *item.Spec.Replicas
+func decodeWorkloadItem(kind string, apiItem workloadAPIItem) (workloadItem, error) {
+	decode := func(section string, raw json.RawMessage, dst any) error {
+		if len(raw) == 0 {
+			return nil
+		}
+		if err := json.Unmarshal(raw, dst); err != nil {
+			return fmt.Errorf("decode kubernetes %s workload %s: %w", kind, section, err)
+		}
+		return nil
 	}
-	if kind == "DaemonSet" {
-		return item.Status.DesiredNumberScheduled
-	}
-	if item.Spec.Completions != nil {
-		return *item.Spec.Completions
-	}
-	return item.Status.Replicas
-}
 
-func readyReplicas(kind string, item workloadItem) int {
-	if kind == "DaemonSet" {
-		return item.Status.NumberReady
+	switch kind {
+	case "Deployment", "StatefulSet", "ReplicaSet":
+		var spec replicatedWorkloadSpec
+		if err := decode("spec", apiItem.Spec, &spec); err != nil {
+			return workloadItem{}, err
+		}
+		var status replicatedWorkloadStatus
+		if err := decode("status", apiItem.Status, &status); err != nil {
+			return workloadItem{}, err
+		}
+		desired := status.Replicas
+		if spec.Replicas != nil {
+			desired = *spec.Replicas
+		}
+		return workloadItem{
+			Metadata:        apiItem.Metadata,
+			DesiredReplicas: desired,
+			ReadyReplicas:   status.ReadyReplicas,
+			Conditions:      status.Conditions,
+		}, nil
+	case "DaemonSet":
+		var status daemonSetStatus
+		if err := decode("status", apiItem.Status, &status); err != nil {
+			return workloadItem{}, err
+		}
+		return workloadItem{
+			Metadata:        apiItem.Metadata,
+			DesiredReplicas: status.DesiredNumberScheduled,
+			ReadyReplicas:   status.NumberReady,
+			Conditions:      status.Conditions,
+		}, nil
+	case "Job":
+		var spec jobSpec
+		if err := decode("spec", apiItem.Spec, &spec); err != nil {
+			return workloadItem{}, err
+		}
+		var status jobStatus
+		if err := decode("status", apiItem.Status, &status); err != nil {
+			return workloadItem{}, err
+		}
+		desired := 0
+		if spec.Completions != nil {
+			desired = *spec.Completions
+		}
+		return workloadItem{
+			Metadata:        apiItem.Metadata,
+			DesiredReplicas: desired,
+			ReadyReplicas:   status.Succeeded,
+			ActiveReplicas:  status.Active,
+			FailedReplicas:  status.Failed,
+			Conditions:      status.Conditions,
+		}, nil
+	case "CronJob":
+		var status cronJobStatus
+		if err := decode("status", apiItem.Status, &status); err != nil {
+			return workloadItem{}, err
+		}
+		return workloadItem{
+			Metadata:       apiItem.Metadata,
+			ActiveReplicas: len(status.Active),
+		}, nil
+	default:
+		return workloadItem{}, fmt.Errorf("unsupported kubernetes workload kind %q", kind)
 	}
-	if kind == "Job" {
-		return item.Status.Succeeded
-	}
-	return item.Status.ReadyReplicas
 }

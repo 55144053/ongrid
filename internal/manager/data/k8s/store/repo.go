@@ -532,6 +532,13 @@ func (r *Repo) UpsertWorkloads(ctx context.Context, items []*model.Workload) err
 			"uid",
 			"desired_replicas",
 			"ready_replicas",
+			"active_replicas",
+			"failed_replicas",
+			"owner_kind",
+			"owner_name",
+			"owner_uid",
+			"revision",
+			"resource_created_at",
 			"labels_json",
 			"annotations_json",
 			"conditions_json",
@@ -895,7 +902,11 @@ func (r *Repo) ListWorkloads(ctx context.Context, f biz.ListWorkloadsFilter) ([]
 		tx = tx.Offset(f.Offset)
 	}
 	var out []*model.Workload
-	if err := tx.Order("namespace ASC, kind ASC, name ASC").Find(&out).Error; err != nil {
+	order := "namespace ASC, kind ASC, name ASC"
+	if len(f.OwnerRefs) > 0 {
+		order = "namespace ASC, owner_name ASC, revision DESC, resource_created_at DESC, name DESC"
+	}
+	if err := tx.Order(order).Find(&out).Error; err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -984,10 +995,76 @@ func applyWorkloadFilter(tx *gorm.DB, f biz.ListWorkloadsFilter) *gorm.DB {
 		tx = tx.Where("kind = ?", f.Kind)
 	}
 	if f.IssueOnly {
-		tx = tx.Where("ready_replicas < desired_replicas")
+		tx = tx.Where(`
+			(LOWER(kind) <> ? AND ready_replicas < desired_replicas)
+			OR
+			(LOWER(kind) = ? AND ready_replicas < desired_replicas AND active_replicas = 0 AND failed_replicas > 0)
+		`, "job", "job")
 	}
-	tx = applyLikeAny(tx, f.Query, []string{"namespace", "kind", "name", "uid"})
+	if f.GroupReplicaSets {
+		tx = tx.Where("NOT (kind = ? AND owner_kind = ? AND (owner_uid <> ? OR owner_name <> ?))", "ReplicaSet", "Deployment", "", "")
+	}
+	if len(f.OwnerRefs) > 0 {
+		clauses := make([]string, 0, len(f.OwnerRefs))
+		args := make([]any, 0, len(f.OwnerRefs)*6)
+		for _, ref := range f.OwnerRefs {
+			namespace := strings.TrimSpace(ref.Namespace)
+			kind := strings.TrimSpace(ref.Kind)
+			name := strings.TrimSpace(ref.Name)
+			uid := strings.TrimSpace(ref.UID)
+			if kind == "" || (name == "" && uid == "") {
+				continue
+			}
+			if uid != "" {
+				clauses = append(clauses, "(namespace = ? AND owner_kind = ? AND (owner_uid = ? OR (owner_uid = ? AND owner_name = ?)))")
+				args = append(args, namespace, kind, uid, "", name)
+				continue
+			}
+			clauses = append(clauses, "(namespace = ? AND owner_kind = ? AND owner_name = ?)")
+			args = append(args, namespace, kind, name)
+		}
+		if len(clauses) == 0 {
+			tx = tx.Where("1 = 0")
+		} else {
+			tx = tx.Where("kind = ?", "ReplicaSet").Where("("+strings.Join(clauses, " OR ")+")", args...)
+		}
+	}
+	if f.GroupReplicaSets {
+		tx = applyGroupedWorkloadQuery(tx, f.Query)
+	} else {
+		tx = applyLikeAny(tx, f.Query, []string{"namespace", "kind", "name", "uid"})
+	}
 	return tx
+}
+
+func applyGroupedWorkloadQuery(tx *gorm.DB, query string) *gorm.DB {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return tx
+	}
+	pattern := "%" + query + "%"
+	return tx.Where(`
+		k8s_workloads.namespace LIKE ?
+		OR k8s_workloads.kind LIKE ?
+		OR k8s_workloads.name LIKE ?
+		OR k8s_workloads.uid LIKE ?
+		OR (
+			k8s_workloads.kind = ?
+			AND EXISTS (
+				SELECT 1
+				FROM k8s_workloads AS child
+				WHERE child.cluster_id = k8s_workloads.cluster_id
+					AND child.namespace = k8s_workloads.namespace
+					AND child.kind = ?
+					AND child.owner_kind = ?
+					AND (
+						(child.owner_uid <> '' AND k8s_workloads.uid <> '' AND child.owner_uid = k8s_workloads.uid)
+						OR ((child.owner_uid = '' OR k8s_workloads.uid = '') AND child.owner_name = k8s_workloads.name)
+					)
+					AND (child.namespace LIKE ? OR child.kind LIKE ? OR child.name LIKE ? OR child.uid LIKE ?)
+			)
+		)
+	`, pattern, pattern, pattern, pattern, "Deployment", "ReplicaSet", "Deployment", pattern, pattern, pattern, pattern)
 }
 
 func applyNodeFilter(tx *gorm.DB, f biz.ListNodesFilter) *gorm.DB {

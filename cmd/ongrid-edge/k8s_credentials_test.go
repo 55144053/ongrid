@@ -42,7 +42,12 @@ func TestK8sCredentialFileRoundTrip(t *testing.T) {
 	filePath := filepath.Join(t.TempDir(), "node-credential.json")
 	info := &tunnel.KubernetesInfo{ClusterID: 7, Role: "node", NodeName: "worker-a"}
 	cfg := &config.Config{Edge: config.EdgeConfig{CloudAddr: "manager:40012"}}
-	out := k8sEnrollResponse{EdgeID: 9, AccessKey: "access", SecretKey: "secret"}
+	out := k8sEnrollResponse{
+		EdgeID:           9,
+		AccessKey:        "access",
+		SecretKey:        "secret",
+		ManagerPublicURL: "https://manager.example",
+	}
 
 	if err := storeK8sCredentialFile(info, out, cfg, filePath); err != nil {
 		t.Fatalf("storeK8sCredentialFile: %v", err)
@@ -60,7 +65,8 @@ func TestK8sCredentialFileRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("loadStoredK8sCredentialFile: %v", err)
 	}
-	if !loaded || loadedCfg.Edge.AccessKey != "access" || loadedCfg.Edge.SecretKey != "secret" || loadedCfg.Edge.CloudAddr != "manager:40012" {
+	if !loaded || loadedCfg.Edge.AccessKey != "access" || loadedCfg.Edge.SecretKey != "secret" ||
+		loadedCfg.Edge.CloudAddr != "manager:40012" || loadedCfg.Edge.ManagerPublicURL != "https://manager.example" {
 		t.Fatalf("loaded=%v cfg=%+v", loaded, loadedCfg.Edge)
 	}
 }
@@ -169,6 +175,18 @@ func TestApplyManagerTelemetryTLSIsOriginScoped(t *testing.T) {
 	if externalTarget.TracesTLSInsecure || externalTarget.LogsTLSInsecure || externalTarget.RemoteWriteTLSInsecure {
 		t.Fatalf("external signals inherited the manager TLS setting: %#v", externalTarget)
 	}
+
+	managerAliasTarget := k8sTelemetryConfig{
+		RemoteWriteEndpoint: "https://192.168.200.1:8443/prometheus/api/v1/write",
+	}
+	applyManagerTelemetryTLS(
+		&managerAliasTarget,
+		"https://host.orb.internal:8443",
+		"https://192.168.200.1:8443",
+	)
+	if !managerAliasTarget.RemoteWriteTLSInsecure {
+		t.Fatalf("canonical manager origin did not inherit the explicit TLS setting: %#v", managerAliasTarget)
+	}
 }
 
 func TestDataContainsValuesRequiresProjectedEmptyKeys(t *testing.T) {
@@ -244,6 +262,7 @@ func TestK8sSecretClientDataKeyRoundTrip(t *testing.T) {
 }
 
 func TestRefreshK8sTelemetryConfigPreservesCurrentCredentialProof(t *testing.T) {
+	t.Setenv("ONGRID_K8S_ENROLL_TLS_INSECURE", "true")
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/internal/k8s/telemetry-config" {
 			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
@@ -263,6 +282,7 @@ func TestRefreshK8sTelemetryConfigPreservesCurrentCredentialProof(t *testing.T) 
 			ClusterID:           7,
 			AccessKey:           proof["access_key"],
 			SecretKey:           proof["secret_key"],
+			ManagerPublicURL:    "https://manager.example",
 			TracesEndpoint:      "https://manager.example/v1/traces",
 			LogsEndpoint:        "https://manager.example/loki/api/v1/push",
 			RemoteWriteEndpoint: "https://manager.example/prometheus/api/v1/write",
@@ -272,14 +292,22 @@ func TestRefreshK8sTelemetryConfigPreservesCurrentCredentialProof(t *testing.T) 
 	}))
 	defer server.Close()
 
-	out, err := refreshK8sTelemetryConfig(context.Background(), &config.Config{Edge: config.EdgeConfig{
-		AccessKey: "controller-access",
-		SecretKey: "controller-secret",
-	}}, server.URL, "kt_current", "ks_current")
+	cfg := &config.Config{Edge: config.EdgeConfig{
+		AccessKey:        "controller-access",
+		SecretKey:        "controller-secret",
+		ManagerPublicURL: "https://stale-manager-alias.example",
+	}}
+	out, err := refreshK8sTelemetryConfig(context.Background(), cfg, server.URL, "kt_current", "ks_current")
 	if err != nil {
 		t.Fatalf("refreshK8sTelemetryConfig: %v", err)
 	}
 	if out.AccessKey != "kt_current" || out.SecretKey != "ks_current" {
 		t.Fatalf("refreshed credential = %#v", out)
+	}
+	if !out.TracesTLSInsecure || !out.LogsTLSInsecure || !out.RemoteWriteTLSInsecure {
+		t.Fatalf("refreshed manager-origin endpoints lost the explicit TLS policy: %#v", out)
+	}
+	if cfg.Edge.ManagerPublicURL != "https://manager.example" {
+		t.Fatalf("manager public URL = %q, want refreshed canonical URL", cfg.Edge.ManagerPublicURL)
 	}
 }

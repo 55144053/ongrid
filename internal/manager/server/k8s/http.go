@@ -272,13 +272,14 @@ func (h *Handler) listWorkloads(w http.ResponseWriter, r *http.Request) {
 	limit := parseListLimit(r.URL.Query().Get("limit"), 100)
 	offset := parseListOffset(r.URL.Query().Get("offset"))
 	filter := biz.ListWorkloadsFilter{
-		ClusterID: id,
-		Namespace: strings.TrimSpace(r.URL.Query().Get("namespace")),
-		Kind:      strings.TrimSpace(r.URL.Query().Get("kind")),
-		Query:     strings.TrimSpace(r.URL.Query().Get("q")),
-		IssueOnly: parseBoolDefault(r.URL.Query().Get("issue_only"), false),
-		Limit:     limit,
-		Offset:    offset,
+		ClusterID:        id,
+		Namespace:        strings.TrimSpace(r.URL.Query().Get("namespace")),
+		Kind:             strings.TrimSpace(r.URL.Query().Get("kind")),
+		Query:            strings.TrimSpace(r.URL.Query().Get("q")),
+		IssueOnly:        parseBoolDefault(r.URL.Query().Get("issue_only"), false),
+		GroupReplicaSets: parseBoolDefault(r.URL.Query().Get("group_replica_sets"), false),
+		Limit:            limit,
+		Offset:           offset,
 	}
 	items, err := h.svc.ListWorkloads(r.Context(), filter)
 	if err != nil {
@@ -635,18 +636,26 @@ type nodeDTO struct {
 }
 
 type workloadDTO struct {
-	ID              uint64          `json:"id"`
-	ClusterID       uint64          `json:"cluster_id"`
-	Namespace       string          `json:"namespace"`
-	Kind            string          `json:"kind"`
-	Name            string          `json:"name"`
-	UID             string          `json:"uid,omitempty"`
-	DesiredReplicas int             `json:"desired_replicas"`
-	ReadyReplicas   int             `json:"ready_replicas"`
-	Labels          json.RawMessage `json:"labels,omitempty"`
-	Annotations     json.RawMessage `json:"annotations,omitempty"`
-	Conditions      json.RawMessage `json:"conditions,omitempty"`
-	LastSeenAt      *time.Time      `json:"last_seen_at,omitempty"`
+	ID                uint64          `json:"id"`
+	ClusterID         uint64          `json:"cluster_id"`
+	Namespace         string          `json:"namespace"`
+	Kind              string          `json:"kind"`
+	Name              string          `json:"name"`
+	UID               string          `json:"uid,omitempty"`
+	DesiredReplicas   int             `json:"desired_replicas"`
+	ReadyReplicas     int             `json:"ready_replicas"`
+	ActiveReplicas    int             `json:"active_replicas"`
+	FailedReplicas    int             `json:"failed_replicas"`
+	OwnerKind         string          `json:"owner_kind,omitempty"`
+	OwnerName         string          `json:"owner_name,omitempty"`
+	OwnerUID          string          `json:"owner_uid,omitempty"`
+	Revision          int64           `json:"revision,omitempty"`
+	CreationTimestamp *time.Time      `json:"creation_timestamp,omitempty"`
+	Labels            json.RawMessage `json:"labels,omitempty"`
+	Annotations       json.RawMessage `json:"annotations,omitempty"`
+	Conditions        json.RawMessage `json:"conditions,omitempty"`
+	LastSeenAt        *time.Time      `json:"last_seen_at,omitempty"`
+	ReplicaSets       []workloadDTO   `json:"replica_sets,omitempty"`
 }
 
 type podDTO struct {
@@ -705,6 +714,7 @@ type telemetryConfigResponse struct {
 	ClusterID              uint64 `json:"cluster_id"`
 	AccessKey              string `json:"access_key"`
 	SecretKey              string `json:"secret_key"`
+	ManagerPublicURL       string `json:"manager_public_url,omitempty"`
 	TracesEndpoint         string `json:"traces_endpoint,omitempty"`
 	TracesAuthMode         string `json:"traces_auth_mode,omitempty"`
 	TracesBasicUser        string `json:"traces_basic_user,omitempty"`
@@ -731,6 +741,7 @@ func telemetryConfigDTO(in *biz.TelemetryConfig) *telemetryConfigResponse {
 		ClusterID:              in.ClusterID,
 		AccessKey:              in.AccessKey,
 		SecretKey:              in.SecretKey,
+		ManagerPublicURL:       in.ManagerPublicURL,
 		TracesEndpoint:         in.TracesEndpoint,
 		TracesAuthMode:         in.TracesAuthMode,
 		TracesBasicUser:        in.TracesBasicUser,
@@ -936,20 +947,34 @@ func workloadDTOFromModel(item *model.Workload) workloadDTO {
 	if item == nil {
 		return workloadDTO{}
 	}
-	return workloadDTO{
-		ID:              item.ID,
-		ClusterID:       item.ClusterID,
-		Namespace:       item.Namespace,
-		Kind:            item.Kind,
-		Name:            item.Name,
-		UID:             item.UID,
-		DesiredReplicas: item.DesiredReplicas,
-		ReadyReplicas:   item.ReadyReplicas,
-		Labels:          rawJSON(item.LabelsJSON, "{}"),
-		Annotations:     rawJSON(item.AnnotationsJSON, "{}"),
-		Conditions:      rawJSON(item.ConditionsJSON, "[]"),
-		LastSeenAt:      item.LastSeenAt,
+	dto := workloadDTO{
+		ID:                item.ID,
+		ClusterID:         item.ClusterID,
+		Namespace:         item.Namespace,
+		Kind:              item.Kind,
+		Name:              item.Name,
+		UID:               item.UID,
+		DesiredReplicas:   item.DesiredReplicas,
+		ReadyReplicas:     item.ReadyReplicas,
+		ActiveReplicas:    item.ActiveReplicas,
+		FailedReplicas:    item.FailedReplicas,
+		OwnerKind:         item.OwnerKind,
+		OwnerName:         item.OwnerName,
+		OwnerUID:          item.OwnerUID,
+		Revision:          item.Revision,
+		CreationTimestamp: item.ResourceCreatedAt,
+		Labels:            rawJSON(item.LabelsJSON, "{}"),
+		Annotations:       rawJSON(item.AnnotationsJSON, "{}"),
+		Conditions:        rawJSON(item.ConditionsJSON, "[]"),
+		LastSeenAt:        item.LastSeenAt,
 	}
+	if len(item.ReplicaSets) > 0 {
+		dto.ReplicaSets = make([]workloadDTO, 0, len(item.ReplicaSets))
+		for _, replicaSet := range item.ReplicaSets {
+			dto.ReplicaSets = append(dto.ReplicaSets, workloadDTOFromModel(replicaSet))
+		}
+	}
+	return dto
 }
 
 func podDTOFromModel(item *model.Pod) podDTO {

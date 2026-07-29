@@ -436,6 +436,9 @@ func TestUsecaseControllerEnrollmentIssuesSeparateTelemetryCredential(t *testing
 	if out.Telemetry == nil {
 		t.Fatal("Enroll() telemetry config is nil")
 	}
+	if out.Telemetry.ManagerPublicURL != "https://manager.example" {
+		t.Fatalf("telemetry manager public URL = %q", out.Telemetry.ManagerPublicURL)
+	}
 	if !strings.HasPrefix(out.Telemetry.AccessKey, "kt_") || !strings.HasPrefix(out.Telemetry.SecretKey, "ks_") {
 		t.Fatalf("telemetry credential has unexpected shape: %#v", out.Telemetry)
 	}
@@ -914,6 +917,127 @@ func TestUsecaseInventoryMergesNodeUIDWithExistingNodeEdge(t *testing.T) {
 	}
 	if _, err := repo.GetNodeByClusterUID(ctx, reg.Cluster.ID, "name:node-a"); !errors.Is(err, errs.ErrNotFound) {
 		t.Fatalf("fallback node err = %v, want not found", err)
+	}
+}
+
+func TestUsecaseInventoryPersistsWorkloadExecutionCountsAndRolloutMetadata(t *testing.T) {
+	ctx := context.Background()
+	repo := newFakeRepo()
+	uc := NewUsecase(repo, newFakeIssuer(), Config{})
+	reg, err := uc.CreateCluster(ctx, CreateClusterInput{Name: "prod"})
+	if err != nil {
+		t.Fatalf("CreateCluster() error = %v", err)
+	}
+	bindFakeController(t, repo, reg.Cluster.ID, 99)
+	createdAt := time.Date(2026, time.July, 28, 8, 9, 10, 0, time.UTC)
+
+	_, err = uc.IngestInventory(ctx, 99, tunnel.KubernetesInventoryRequest{
+		ClusterID: reg.Cluster.ID,
+		Role:      model.RoleController,
+		Workloads: []tunnel.KubernetesWorkloadSnapshot{
+			{
+				Kind:            "Job",
+				Namespace:       "jobs",
+				Name:            "batch",
+				UID:             "job-uid",
+				DesiredReplicas: 3,
+				ReadyReplicas:   1,
+				ActiveReplicas:  1,
+				FailedReplicas:  1,
+			},
+			{
+				Kind:              "ReplicaSet",
+				Namespace:         "apps",
+				Name:              "api-7d8f9",
+				UID:               "rs-uid",
+				OwnerKind:         "Deployment",
+				OwnerName:         "api",
+				OwnerUID:          "deployment-uid",
+				Revision:          12,
+				CreationTimestamp: &createdAt,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("IngestInventory() error = %v", err)
+	}
+	if len(repo.lastWorkloads) != 2 {
+		t.Fatalf("persisted workloads = %d, want 2", len(repo.lastWorkloads))
+	}
+	got := repo.lastWorkloads[0]
+	if got.ActiveReplicas != 1 || got.FailedReplicas != 1 {
+		t.Fatalf("workload execution = active:%d failed:%d, want 1/1", got.ActiveReplicas, got.FailedReplicas)
+	}
+	rs := repo.lastWorkloads[1]
+	if rs.OwnerKind != "Deployment" || rs.OwnerName != "api" || rs.OwnerUID != "deployment-uid" || rs.Revision != 12 {
+		t.Fatalf("workload rollout metadata = owner:%s/%s/%s revision:%d", rs.OwnerKind, rs.OwnerName, rs.OwnerUID, rs.Revision)
+	}
+	if rs.ResourceCreatedAt == nil || !rs.ResourceCreatedAt.Equal(createdAt) {
+		t.Fatalf("workload resource created at = %v, want %v", rs.ResourceCreatedAt, createdAt)
+	}
+}
+
+type groupingWorkloadRepo struct {
+	*fakeRepo
+	listFilters []ListWorkloadsFilter
+	topLevel    []*model.Workload
+	replicaSets []*model.Workload
+}
+
+func (r *groupingWorkloadRepo) ListWorkloads(_ context.Context, f ListWorkloadsFilter) ([]*model.Workload, error) {
+	r.listFilters = append(r.listFilters, f)
+	if len(f.OwnerRefs) > 0 {
+		return r.replicaSets, nil
+	}
+	return r.topLevel, nil
+}
+
+func TestUsecaseListWorkloadsAttachesDeploymentReplicaSetVersions(t *testing.T) {
+	ctx := context.Background()
+	base := newFakeRepo()
+	reg, err := NewUsecase(base, newFakeIssuer(), Config{}).CreateCluster(ctx, CreateClusterInput{Name: "prod"})
+	if err != nil {
+		t.Fatalf("CreateCluster() error = %v", err)
+	}
+	createdAt := time.Date(2026, time.July, 28, 8, 9, 10, 0, time.UTC)
+	repo := &groupingWorkloadRepo{
+		fakeRepo: base,
+		topLevel: []*model.Workload{{
+			ID:        1,
+			ClusterID: reg.Cluster.ID,
+			Namespace: "apps",
+			Kind:      "Deployment",
+			Name:      "api",
+			UID:       "deployment-uid",
+			Revision:  12,
+		}},
+		replicaSets: []*model.Workload{
+			{ID: 3, ClusterID: reg.Cluster.ID, Namespace: "apps", Kind: "ReplicaSet", Name: "api-old", OwnerKind: "Deployment", OwnerName: "api", OwnerUID: "deployment-uid", Revision: 11, ResourceCreatedAt: &createdAt},
+			{ID: 2, ClusterID: reg.Cluster.ID, Namespace: "apps", Kind: "ReplicaSet", Name: "api-current", OwnerKind: "Deployment", OwnerName: "api", OwnerUID: "deployment-uid", Revision: 12, ResourceCreatedAt: &createdAt},
+		},
+	}
+	uc := NewUsecase(repo, newFakeIssuer(), Config{})
+
+	items, err := uc.ListWorkloads(ctx, ListWorkloadsFilter{
+		ClusterID:        reg.Cluster.ID,
+		GroupReplicaSets: true,
+		Limit:            100,
+	})
+	if err != nil {
+		t.Fatalf("ListWorkloads() error = %v", err)
+	}
+	if len(repo.listFilters) != 2 {
+		t.Fatalf("ListWorkloads() repo calls = %d, want 2", len(repo.listFilters))
+	}
+	refs := repo.listFilters[1].OwnerRefs
+	if len(refs) != 1 || refs[0].Namespace != "apps" || refs[0].Kind != "Deployment" || refs[0].Name != "api" || refs[0].UID != "deployment-uid" {
+		t.Fatalf("ReplicaSet owner refs = %+v", refs)
+	}
+	if len(items) != 1 || len(items[0].ReplicaSets) != 2 {
+		t.Fatalf("grouped workloads = %+v", items)
+	}
+	if items[0].ReplicaSets[0].Revision != 12 || items[0].ReplicaSets[1].Revision != 11 {
+		t.Fatalf("ReplicaSet revision order = %+v", items[0].ReplicaSets)
 	}
 }
 
@@ -1753,6 +1877,9 @@ func TestUsecaseCleanupEventsAppliesRetentionAndClusterCap(t *testing.T) {
 
 func TestUsecaseListEventsIssueOnlyExcludesRecoveredWarnings(t *testing.T) {
 	ctx := context.Background()
+	now := time.Now()
+	recent := now.Add(-time.Minute)
+	stale := now.Add(-time.Hour)
 	repo := newFakeRepo()
 	uc := NewUsecase(repo, newFakeIssuer(), Config{})
 	reg, err := uc.CreateCluster(ctx, CreateClusterInput{Name: "prod"})
@@ -1776,7 +1903,8 @@ func TestUsecaseListEventsIssueOnlyExcludesRecoveredWarnings(t *testing.T) {
 		{ClusterID: reg.Cluster.ID, UID: "active-pod", Type: "Warning", InvolvedKind: "Pod", InvolvedNamespace: "default", InvolvedName: "broken", InvolvedUID: "pod-broken"},
 		{ClusterID: reg.Cluster.ID, UID: "recovered-pod", Type: "Warning", InvolvedKind: "Pod", InvolvedNamespace: "default", InvolvedName: "recovered", InvolvedUID: "pod-recovered"},
 		{ClusterID: reg.Cluster.ID, UID: "active-node", Type: "Warning", InvolvedKind: "Node", InvolvedName: "node-bad"},
-		{ClusterID: reg.Cluster.ID, UID: "unknown", Type: "Warning", InvolvedKind: "PersistentVolumeClaim", InvolvedNamespace: "default", InvolvedName: "data"},
+		{ClusterID: reg.Cluster.ID, UID: "recent-unknown", Type: "Warning", InvolvedKind: "PersistentVolumeClaim", InvolvedNamespace: "default", InvolvedName: "data", LastTimestamp: &recent},
+		{ClusterID: reg.Cluster.ID, UID: "recovered-hpa", Type: "Warning", InvolvedKind: "HorizontalPodAutoscaler", InvolvedNamespace: "default", InvolvedName: "api", LastTimestamp: &stale, LastSeenAt: &now},
 	}
 
 	items, err := uc.ListEvents(ctx, ListEventsFilter{ClusterID: reg.Cluster.ID, IssueOnly: true, Limit: 100})
@@ -1786,12 +1914,76 @@ func TestUsecaseListEventsIssueOnlyExcludesRecoveredWarnings(t *testing.T) {
 	if len(items) != 3 {
 		t.Fatalf("ListEvents(issue) count = %d, want 3", len(items))
 	}
+	for _, item := range items {
+		if item.UID == "recovered-hpa" {
+			t.Fatalf("stale HPA warning remained actionable: %#v", item)
+		}
+	}
 	total, err := uc.CountEvents(ctx, ListEventsFilter{ClusterID: reg.Cluster.ID, IssueOnly: true})
 	if err != nil {
 		t.Fatalf("CountEvents(issue) error = %v", err)
 	}
 	if total != 3 {
 		t.Fatalf("CountEvents(issue) = %d, want 3", total)
+	}
+}
+
+func TestActionableWarningEventUntrackedResourceUsesOccurrenceTime(t *testing.T) {
+	now := time.Date(2026, 7, 29, 6, 0, 0, 0, time.UTC)
+	recent := now.Add(-actionableWarningWindow)
+	stale := recent.Add(-time.Nanosecond)
+	recentHPAMetric := now.Add(-hpaMetricWarningWindow)
+	recoveredHPAMetric := recentHPAMetric.Add(-time.Nanosecond)
+	lastSeen := now
+
+	tests := []struct {
+		name  string
+		event *model.Event
+		want  bool
+	}{
+		{
+			name:  "recent boundary",
+			event: &model.Event{InvolvedKind: "HorizontalPodAutoscaler", LastTimestamp: &recent},
+			want:  true,
+		},
+		{
+			name:  "stale occurrence with fresh ingestion",
+			event: &model.Event{InvolvedKind: "HorizontalPodAutoscaler", LastTimestamp: &stale, LastSeenAt: &lastSeen},
+			want:  false,
+		},
+		{
+			name:  "ingestion timestamp only",
+			event: &model.Event{InvolvedKind: "HorizontalPodAutoscaler", LastSeenAt: &lastSeen},
+			want:  false,
+		},
+		{
+			name: "repeating HPA metric warning at recent boundary",
+			event: &model.Event{
+				InvolvedKind:  "HorizontalPodAutoscaler",
+				Reason:        "FailedGetResourceMetric",
+				LastTimestamp: &recentHPAMetric,
+			},
+			want: true,
+		},
+		{
+			name: "quiet HPA metric warning is recovered before generic warning window",
+			event: &model.Event{
+				InvolvedKind:  "HorizontalPodAutoscaler",
+				Reason:        "FailedComputeMetricsReplicas",
+				LastTimestamp: &recoveredHPAMetric,
+				LastSeenAt:    &lastSeen,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := actionableWarningEvent(tt.event, nil, nil, nil, nil, now)
+			if got != tt.want {
+				t.Fatalf("actionableWarningEvent() = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1803,6 +1995,7 @@ type fakeRepo struct {
 	deviceNodeIDs       map[uint64]uint64
 	pods                map[string]*model.Pod
 	events              []*model.Event
+	lastWorkloads       []*model.Workload
 	pruned              []string
 	lastInstallation    *model.Installation
 	telemetryCredential *model.TelemetryCredential
@@ -2176,7 +2369,12 @@ func (r *fakeRepo) UpdateNodeEdge(_ context.Context, nodeID, edgeID uint64, devi
 	return errs.ErrNotFound
 }
 
-func (r *fakeRepo) UpsertWorkloads(_ context.Context, _ []*model.Workload) error {
+func (r *fakeRepo) UpsertWorkloads(_ context.Context, items []*model.Workload) error {
+	r.lastWorkloads = make([]*model.Workload, 0, len(items))
+	for _, item := range items {
+		cp := *item
+		r.lastWorkloads = append(r.lastWorkloads, &cp)
+	}
 	return nil
 }
 

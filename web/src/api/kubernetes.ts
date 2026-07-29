@@ -67,6 +67,14 @@ export type KubernetesWorkload = {
   uid?: string;
   desired_replicas: number;
   ready_replicas: number;
+  active_replicas?: number;
+  failed_replicas?: number;
+  owner_kind?: string;
+  owner_name?: string;
+  owner_uid?: string;
+  revision?: number;
+  creation_timestamp?: string | null;
+  replica_sets?: KubernetesWorkload[];
   labels?: Record<string, unknown>;
   annotations?: Record<string, unknown>;
   conditions?: unknown[];
@@ -195,7 +203,15 @@ export function listKubernetesNodes(
 
 export function listKubernetesWorkloads(
   clusterID: string | number,
-  params?: { namespace?: string; kind?: string; q?: string; issue_only?: boolean; limit?: number; offset?: number },
+  params?: {
+    namespace?: string;
+    kind?: string;
+    q?: string;
+    issue_only?: boolean;
+    group_replica_sets?: boolean;
+    limit?: number;
+    offset?: number;
+  },
 ) {
   const qs = buildQuery(params);
   return request<ListResponse<KubernetesWorkload>>(

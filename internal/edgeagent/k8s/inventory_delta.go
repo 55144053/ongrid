@@ -135,8 +135,12 @@ func (c *inventoryCache) applyWatchUpsert(spec inventoryWatchSpec, event k8sWatc
 		c.mu.Unlock()
 		trigger.events = []tunnel.KubernetesEventSnapshot{snap}
 	case watchResourceWorkloads:
-		var item workloadItem
-		if err := unmarshalWatchObject(event, &item); err != nil {
+		var apiItem workloadAPIItem
+		if err := unmarshalWatchObject(event, &apiItem); err != nil {
+			return inventoryWatchTrigger{}, err
+		}
+		item, err := decodeWorkloadItem(spec.workloadKind, apiItem)
+		if err != nil {
 			return inventoryWatchTrigger{}, err
 		}
 		snap := workloadSnapshotFromItem(spec.workloadKind, item)
@@ -246,16 +250,24 @@ func nodeSnapshotFromItem(item nodeItem) tunnel.KubernetesNodeSnapshot {
 }
 
 func workloadSnapshotFromItem(kind string, item workloadItem) tunnel.KubernetesWorkloadSnapshot {
+	ownerKind, ownerName, ownerUID := controllerOwnerDetails(item.Metadata.OwnerReferences)
 	return tunnel.KubernetesWorkloadSnapshot{
-		Kind:            kind,
-		Namespace:       item.Metadata.Namespace,
-		Name:            item.Metadata.Name,
-		UID:             item.Metadata.UID,
-		DesiredReplicas: desiredReplicas(kind, item),
-		ReadyReplicas:   readyReplicas(kind, item),
-		Labels:          item.Metadata.Labels,
-		Annotations:     item.Metadata.Annotations,
-		Conditions:      conditionMaps(item.Status.Conditions),
+		Kind:              kind,
+		Namespace:         item.Metadata.Namespace,
+		Name:              item.Metadata.Name,
+		UID:               item.Metadata.UID,
+		DesiredReplicas:   item.DesiredReplicas,
+		ReadyReplicas:     item.ReadyReplicas,
+		ActiveReplicas:    item.ActiveReplicas,
+		FailedReplicas:    item.FailedReplicas,
+		OwnerKind:         ownerKind,
+		OwnerName:         ownerName,
+		OwnerUID:          ownerUID,
+		Revision:          workloadRevision(item.Metadata.Annotations),
+		CreationTimestamp: item.Metadata.CreationTimestamp,
+		Labels:            item.Metadata.Labels,
+		Annotations:       item.Metadata.Annotations,
+		Conditions:        conditionMaps(item.Conditions),
 	}
 }
 
